@@ -10,7 +10,7 @@
 [Xingxing Weng]()<sup>1</sup>, 
 [Shimaa Holail](https://scholar.google.com/citations?user=WKKVqDgAAAAJ&hl=en)<sup>1</sup>, 
 [Chen Hao]()<sup>1</sup>, 
-[Gui Song-Xia](https://scholar.google.com/citations?user=SAUCVsEAAAAJ&hl=en)<sup>1</sup>, 
+[Gui Song-Xia](https://scholar.google.com/citations?user=SAUCVsEAAAAJ&hl=en)<sup>1</sup>
 
 
 <sup>1</sup> Wuhan University, <sup>2</sup> Benha University
