@@ -50,10 +50,6 @@ Each image pair consists of the following:
   <img src="./images/zoom-test-map.gif" width="304.8" height="304.8" />
 </p>
 
-
-## Description
-
-Flooding can cause extensive damage to people, ecosystems, and economies, making it a severe natural disaster. Operating ground-based equipment in flood zones is hazardous, and limited physical access to flooded areas can make it challenging to acquire information about flood extent on the ground. Accurately detecting floods and flood extent via remote sensing greatly aids in mitigating and responding to these events. Remote sensing technology, such as satellites and airborne sensors, can provide valuable information about the extent of flooding, crucial for developing appropriate response strategies and minimizing damages. In this work, we present a new open-source global-scale flood detection dataset, S1GFloods, has been compiled to aid in flood detection. The dataset includes global pairs of high-resolution Sentinel-1 SAR images covering 42 flood events between 2016 and 2022, along with ground truth maps for each pixel. It showcases flooded areas such as rivers, lakes, vegetation, urban and rural areas, and common causes of flooding. This dataset provides critical information for developing strategies to mitigate and respond to future flooding events.
  
  ![image1](./images/2.png)
 
