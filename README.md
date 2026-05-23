@@ -172,7 +172,7 @@ You can download our novel public S1GFloods dataset through the following link:
 - Testing
 
   ```shell
-  python test.py
+  python eval.py
   ```
   
 ## Results
