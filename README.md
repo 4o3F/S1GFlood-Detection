@@ -22,7 +22,7 @@
 
 ## 🛎️Updates 
 
-* **` February 2026☀️☀️`**: S1GFloods has been selected as 🔥ESI Hot Paper and Highly Cited Paper top 1% of publications in the academic field of Geosciences🏆!!
+* **`🎉 February 2026 Achievement`**: S1GFloods has been selected as an 🔥 ESI Hot Paper and Highly Cited Paper, placing it among the top 1% of publications in the Geosciences field 🏆🌍
 * **` 13 May 2024`**: DAM-Net has been accepted by [ISPRS JP&RS and online available](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) now!!
 * **` 02 July 2023`**: The S1GFloods benchmark related to our paper has now released. You are warmly welcome to use it!!
 * **` 25 June 2023`**: DAM-Net has been submitted for publication at ISPRS Journal of Photogrammetry and Remote Sensing!!
