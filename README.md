@@ -15,10 +15,7 @@
 
 <sup>1</sup> Wuhan University, <sup>2</sup> Benha University
 
-[![ISPRS paper](https://img.shields.io/badge/ISPRS-paper-cyan)](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) 
-[![Google Drive Dataset](https://img.shields.io/badge/Google-Dataset-blue)](https://drive.google.com/file/d/1bm_sFfJ05Fryj6Ib1niIidOywljzIEgo/view?usp=sharing)   
-[![HuggingFace Dataset](https://img.shields.io/badge/HuggingFace-Dataset-yellow)](https://huggingface.co/datasets/Tamer-Saleh/S1GFloods) 
-[![Baidu Drive Dataset](https://img.shields.io/badge/Baidu-Drive-green)](https://pan.baidu.com/s/1E4dEJtlQ6xeUDRPGO904KQ?pwd=m6gr)
+[![ISPRS paper](https://img.shields.io/badge/ISPRS-paper-cyan)](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168)  [![Google Drive Dataset](https://img.shields.io/badge/GoogleDrive-Dataset-blue)](https://drive.google.com/file/d/1bm_sFfJ05Fryj6Ib1niIidOywljzIEgo/view?usp=sharing)   [![HuggingFace Dataset](https://img.shields.io/badge/HuggingFace-Dataset-yellow)](https://huggingface.co/datasets/Tamer-Saleh/S1GFloods)  [![Baidu Drive Dataset](https://img.shields.io/badge/Baidu-Drive-green)](https://pan.baidu.com/s/1E4dEJtlQ6xeUDRPGO904KQ?pwd=m6gr)
 
 </div>
 
