@@ -46,8 +46,8 @@ Each image pair consists of the following:
 
 
  <p align="center">
-  <img src="./images/test-map.gif" width="208.788" height="121.92" />
-  <img src="./images/zoom-test-map.gif" width="121.92" height="121.92" />
+  <img src="./images/test-map.gif" width="417.576" height="243.84" />
+  <img src="./images/zoom-test-map.gif" width="243.84" height="243.84" />
 </p>
 
 
