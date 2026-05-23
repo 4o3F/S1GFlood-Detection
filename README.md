@@ -152,7 +152,6 @@ An overview of the proposed DAM-Net. The feature maps of the pre-and post-event 
               │  
 
               
-
 ## :truck: Datasets <a name="dataset"></a>
 
 You can download our novel public S1GFloods dataset through the following link:
@@ -161,6 +160,33 @@ You can download our novel public S1GFloods dataset through the following link:
 - [x] [S1GFloods][Google Drive Link](https://drive.google.com/file/d/1bm_sFfJ05Fryj6Ib1niIidOywljzIEgo/view?usp=sharing)
 - [x] [S1GFloods][HuggingFace Link](https://huggingface.co/datasets/Tamer-Saleh/S1GFloods)
 
+
+## 📚 Use example
+
+- Training
+
+  ```shell
+  python train.py
+  ```
+
+- Testing
+
+  ```shell
+  python test.py
+  ```
+  
+## Results
+
+<p align="center">
+<img src=./images/R1.png width="100%">
+</P>
+
+
+## Visualization
+
+<p align="center">
+<img src=./images/R2.png width="100%">
+</P>
 
 
 ### :page_with_curl: Citing <a name="citing"></a>
