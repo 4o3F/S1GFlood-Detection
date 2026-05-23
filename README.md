@@ -115,57 +115,38 @@ An overview of the proposed DAM-Net. The feature maps of the pre-and post-event 
 - :open_book:	:open_book:	 :open_book: ViTAEv2 [[here](https://arxiv.org/pdf/2202.10108.pdf)]
 
 
-## :speech_balloon: <span id="jump">Dataset Preparation</span>
+## 📒 Dataset Preparation
 
-### :point_right: Data Structure
+  Prepare the following folders to organize this repo:
 
-```yaml
-For S1GFloods dataset, clip the images to 256 × 256 patches. Please, respect the following structure: 
-├————train/
-|      ├———Pre/                                  Images of Time 1 before the flood event
-            ├———<region><year><XY>.png
-            ...
-            ├———<region><year><XY>.png
-|      ├———Post/                                 Images of Time 2 after the flood event
-            ├———<region><year><XY>.png
-            ...
-            ├———<region><year><XY>.png            
-|      ├———GT/                                   Ground truth labels
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-|
-├————val/
-|      ├———Pre/  
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-|      ├———Post/
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-|      ├———GT/
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-|
-├————test/
-|      ├———Pre/  
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-|      ├———Post/
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-|      ├———GT/
-            ├———<region><year><XY>.png 
-            ...
-            ├———<region><year><XY>.png 
-```
+     For the S1GFloods dataset, clip the images to 256 × 256 patches. Please, respect the following structure: 
+              ├── SIGFloods
+              │   ├── train
+              │   │   ├── A                           Images of Time 1 before the flood event
+              │   │   │   └── <region><year><XY>.png
+              │   │   ├── B                           Images of Time 2 after the flood event
+              │   │   │   └── <region><year><XY>.png
+              │   │   └── GT                          Ground truth labels
+              │   │       └── <region><year><XY>.png
+              │   ├── val 
+              │   │   ├── A                           
+              │   │   │   └── <region><year><XY>.png
+              │   │   ├── B                           
+              │   │   │   └── <region><year><XY>.png
+              │   │   └── GT                          
+              │   │       └── <region><year><XY>.png
+              │   ├── test
+              │   │   ├── A                           
+              │   │   │   └── <region><year><XY>.png
+              │   │   ├── B                           
+              │   │   │   └── <region><year><XY>.png
+              │   │   └── GT                          
+              │   │       └── <region><year><XY>.png
+              │  
 
+              
 
-### :truck: Datasets <a name="dataset"></a>
+## :truck: Datasets <a name="dataset"></a>
 
 You can download our novel public S1GFloods dataset through the following link:
 
@@ -192,7 +173,7 @@ You can download our novel public S1GFloods dataset through the following link:
   
 ## Contact Information
 
-If you have any questions or would like to collaborate, please reach out to me at tamersaleh@whu.edu.cn or feel free to make issues.
+If you have any questions or would like to collaborate, please reach out to me at tamersaleh@whu.edu.cn.
 
 ## License
 The datasets are released for non-commercial and research purposes only. For commercial purposes, please contact the authors.
