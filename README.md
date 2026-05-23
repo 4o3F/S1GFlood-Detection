@@ -1,33 +1,62 @@
-<h1 align="center">
-  <b>DAM-Net: Global Flood Detection from SAR Imagery Using Differential Attention Metric-Based Vision Transformers</b><br>
-</h1>
+![demo](images/1.png)
 
-<h2 align="left">Authors <br></h2>
+<div align="center">
+<h1 align="center">☀️S1GFloods Benchmark☀️</h1>
 
-[![Author](https://img.shields.io/badge/Tamer-Saleh-orange.svg)](https://www.bu.edu.eg/staff/tamermohamed3) 
-[![Author](https://img.shields.io/badge/GuiSong-Xia-orange.svg)](http://www.captain-whu.com/xia_En.html) 
-[![Author](https://img.shields.io/badge/Shimaa-Holail-orange.svg)](https://www.linkedin.com/in/shimaaholail/) 
-[![Author](https://img.shields.io/badge/Xingxing-Weng-orange.svg)]() 
-[![Author](https://img.shields.io/badge/Chen-Hao-orange.svg)]() 
+<h3 align="center">DAM-Net: Flood detection from SAR imagery using differential attention metric-based vision transformers</h3>
 
 
-## Updates
-| :zap:         | March, 2023: DAM-Net has been submitted for publication at ISPRS Journal of Photogrammetry and Remote Sensing. |
-|---------------|:------------------------|
+[Tamer Saleh](https://scholar.google.com/citations?user=KAmm5ZkAAAAJ&hl=en)<sup>1,2</sup>, 
+[Xingxing Weng]()<sup>1</sup>, 
+[Shimaa Holail](https://scholar.google.com/citations?user=WKKVqDgAAAAJ&hl=en)<sup>1</sup>, 
+[Chen Hao]()<sup>1</sup>, 
+[Gui Song-Xia](https://scholar.google.com/citations?user=SAUCVsEAAAAJ&hl=en)<sup>1</sup>, 
 
 
-## Preamble
-The following animation shows SAR images before and after the event and a sample of flooded area findings for a rural area in Iran that was hit by a flood in March 2019. The right figure provides an enlarged visual of a 1 km x 1 km area within the larger area as in the yellow box, showing the size of the affected buildings from the flood by our model.
+<sup>1</sup> Wuhan University, <sup>2</sup> Benha University
 
- <div align="left">
-  <img src="https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/test-map.gif" width="480" height="340" />
-  <img src="https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/zoom-test-map.gif" width="340" height="340" />
+[![ISPRS paper](https://img.shields.io/badge/ISPRS-paper-cyan)](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) [![Google Drive Dataset](https://img.shields.io/badge/Google-Drive-Dataset-blue)](https://drive.google.com/file/d/1bm_sFfJ05Fryj6Ib1niIidOywljzIEgo/view?usp=sharing)   [![HuggingFace Dataset](https://img.shields.io/badge/HuggingFace-Dataset-yellow)](https://huggingface.co/datasets/Tamer-Saleh/S1GFloods) [![Baidu Drive Dataset](https://img.shields.io/badge/Baidu-Drive-green)](https://pan.baidu.com/s/1E4dEJtlQ6xeUDRPGO904KQ?pwd=m6gr) ![visitors](https://visitor-badge.laobi.icu/badge?page_id=Tamer-Saleh.S1GFlood-Detection&left_color=%2363C7E6&right_color=%23CEE75F)
+
 </div>
+
+
+## 🛎️Updates 
+
+* **` February 2026☀️☀️`**: S1GFloods has been selected as 🔥ESI Hot Paper and Highly Cited Paper top 1% of publications in the academic field of Geosciences🏆!!
+* **` 13 May 2024`**: DAM-Net has been accepted by [ISPRS JP&RS and online available](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) now!!
+* **` 02 July 2023`**: The S1GFloods benchmark related to our paper has now released. You are warmly welcome to use it!!
+* **` 25 June 2023`**: DAM-Net has been submitted for publication at ISPRS Journal of Photogrammetry and Remote Sensing!!
+* **` 01 Jun 2023`**: The [arXiv paper](https://arxiv.org/abs/2306.00704v1) of DAM-Net is now online.
+
+
+## 🔭Dataset Overview
+
+* [**S1GFloods**](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) is the first open-access, globally distributed, event-diverse Sentinel-1 SAR dataset specifically curated to support AI-based flood response. It consists of 5360 image pairs at 256 × 256 resolution, covering **46** heavy flood events between 2015 and 2022 and spanning **6** continents of the world, with a particular focus on developing countries. The following animation shows SAR images before and after the event and a sample of flooded area findings for a rural area in Iran that was hit by a flood in March 2019. The right figure provides an enlarged visual of a 1 km x 1 km area within the larger area as in the yellow box, showing the size of the affected buildings from the flood by our model.
+
+- **Training Set**: 4300 image pairs  
+- **Validation Set**: 530 image pairs  
+- **Testing Set**: 530 image pairs 
+- **Image Size**: 256 × 256 pixels
+- **Spatial Resolution**: 10 meters  
+
+Each image pair consists of the following:
+   - A binary label map manually annotated  
+   - Pixel value `0`: background / no flood
+   - Pixel value `255`: newly developed floods
+
+
+ <p align="center">
+  <img src="./images/test-map.gif" width="480" height="340" />
+  <img src="./images/zoom-test-map.gif" width="340" height="340" />
+</p>
+
 
 ## Description
 
 Flooding can cause extensive damage to people, ecosystems, and economies, making it a severe natural disaster. Operating ground-based equipment in flood zones is hazardous, and limited physical access to flooded areas can make it challenging to acquire information about flood extent on the ground. Accurately detecting floods and flood extent via remote sensing greatly aids in mitigating and responding to these events. Remote sensing technology, such as satellites and airborne sensors, can provide valuable information about the extent of flooding, crucial for developing appropriate response strategies and minimizing damages. In this work, we present a new open-source global-scale flood detection dataset, S1GFloods, has been compiled to aid in flood detection. The dataset includes global pairs of high-resolution Sentinel-1 SAR images covering 42 flood events between 2016 and 2022, along with ground truth maps for each pixel. It showcases flooded areas such as rivers, lakes, vegetation, urban and rural areas, and common causes of flooding. This dataset provides critical information for developing strategies to mitigate and respond to future flooding events.
  
+ ![image1](./images/2.png)
+
  <div align="center">
   <img src="https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/Bangladesh-Img.gif" width="133" height="200" />
   <img src="https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/Iran-Img.gif" width="266" height="200" />
@@ -59,17 +88,7 @@ Flooding can cause extensive damage to people, ecosystems, and economies, making
 </div>
 
 
-| Image Ref. |      Site     | S1 Pre Date  | S1 Post Date |    GT Date   |
-| ---------- | ------------- | ------------ | ------------ | ------------ |
-|   Img (1)  |   Bangladesh  |  14-03-2017  |  12-07-2017  |  12-07-2017  |
-|   Img (2)  |      Iran     |  12-07-2019  |  29-03-2019  |  29-03-2019  |
-|   Img (3)  |    Nigeria    |  26-08-2022  |  13-10-2022  |  13-10-2022  |
-|   Img (4)  |   Nanchang    |  21-04-2020  |  14-07-2020  |  14-07-2020  |
-|   Img (5)  |     Wuhan     |  02-05-2020  |  13-07-2020  |  13-07-2020  |
-|   Img (6)  | Redrivernorth |  09-02-2019  |  28-05-2019  |  28-05-2019  |  
-|   Img (7)  |     Sudan     |  13-07-2020  |  23-09-2020  |  23-09-2020  |
-|   Img (8)  |   Florence    |  21-07-2018  |  19-09-2018  |  19-09-2018  |
-|   Img (9)  |     Zambia    |  25-03-2017  |  06-04-2017  |  06-04-2017  |
+![image3](./images/4.png)
 
 
 ## Requirements
@@ -85,15 +104,7 @@ Flooding can cause extensive damage to people, ecosystems, and economies, making
 
 ## Our model
 An overview of the proposed DAM-Net. The feature maps of the pre-and post-event image pairs are extracted through a Siamese structure and pre-trained remote sensing. 
-![Overall](https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/overall.png)
-
- 
-## Quantitative Results
-![image-QuantitativeResult](https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/table-test.jpg)
-
-## Qualitative Results
-A visual comparison of flood detection results in the Iran dataset. The first three images, (a), (b), and (c), represent the pre-flood image, post-flood image, and binary ground truth, respectively. The subsequent images show a comparison of flood detection using various methods, including (d) Unet, (e) FC-Siam-Conc, (f) FC-Siam-Diff, (g) SNUNet-ECAM, (h) Siam-Nested-Unet, (i) ResNet50-IMP, (j) ResNet50-RSP, (k) Swin-T-IMP, (l) ViTAEv2-IMP, (m) Swin-T-RSP, and (n) our proposed DAM-Net method.
-![image-QualitativeResult](https://github.com/Tamer-Saleh/GFlood-Detection/blob/Flood-Mapping/images/Iran-results.png)
+![Overall](./images/overall.png)
 
 
 ### 🔭 Baselines <a name="baselines"></a>
@@ -159,25 +170,29 @@ For S1GFloods dataset, clip the images to 256 × 256 patches. Please, respect th
             ├———<region><year><XY>.png 
 ```
 
+
 ### :truck: Datasets <a name="dataset"></a>
 
-The full train and test code will be released soon. You can download our novel public S1GFloods dataset through the following link:
+You can download our novel public S1GFloods dataset through the following link:
 
-- [x] [S1GFloods][baidu drive](https://pan.baidu.com/s/1E4dEJtlQ6xeUDRPGO904KQ?pwd=m6gr) Passward: (m6gr)
-- [x] [S1GFloods][Google Drive Link](https://drive.google.com/file/d/1bm_sFfJ05Fryj6Ib1niIidOywljzIEgo/view?usp=sharing) 
+- [x] [S1GFloods][baidu drive](https://pan.baidu.com/s/1E4dEJtlQ6xeUDRPGO904KQ?pwd=m6gr)
+- [x] [S1GFloods][Google Drive Link](https://drive.google.com/file/d/1bm_sFfJ05Fryj6Ib1niIidOywljzIEgo/view?usp=sharing)
+- [x] [S1GFloods][HuggingFace Link](https://huggingface.co/datasets/Tamer-Saleh/S1GFloods)
+
+
 
 ### :page_with_curl: Citing <a name="citing"></a>
 
 ```bibtex
-@ARTICLE{tamersalehdam2023,
-  Author = {T. Saleh, G-S Xia, S. Holail, X. Weng, and C. Hao},
-  Title = {DAM-Net: Global Flood Detection from SAR Imagery Using Differential Attention Metric-Based Vision Transformers},
-  Journal = {ISPRS Journal of Photogrammetry and Remote Sensing},
-  Year = {2023},
-  volume={},
-  number={},
-  pages={1-21}
-  }
+@article{saleh2024dam,
+  title={DAM-Net: Flood detection from SAR imagery using differential attention metric-based vision transformers},
+  author={Saleh, Tamer and Weng, Xingxing and Holail, Shimaa and Hao, Chen and Xia, Gui-Song},
+  journal={ISPRS Journal of Photogrammetry and Remote Sensing},
+  volume={212},
+  pages={440--453},
+  year={2024},
+  publisher={Elsevier}
+}
 ```
 
   
@@ -186,7 +201,7 @@ The full train and test code will be released soon. You can download our novel p
 If you have any questions or would like to collaborate, please reach out to me at tamersaleh@whu.edu.cn or feel free to make issues.
 
 ## License
-The code and datasets are released for non-commercial and research purposes only. For commercial purposes, please contact the authors.
+The datasets are released for non-commercial and research purposes only. For commercial purposes, please contact the authors.
 
 
 ## Acknowledgment
@@ -201,6 +216,4 @@ Appreciate the work from the following repositories:
 - [ASF-Dataset](https://search.asf.alaska.edu/)
 - [Sentinel-Hub](https://scihub.copernicus.eu/)
 - [SNAP Toolbox](http://step.esa.int/main/download/)
-
-
 
