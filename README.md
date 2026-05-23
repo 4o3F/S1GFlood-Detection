@@ -31,18 +31,22 @@
 
 ## 🔭Dataset Overview
 
-* [**S1GFloods**](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) is the first open-access, globally distributed, event-diverse Sentinel-1 SAR dataset specifically curated to support AI-based flood response. It consists of 5360 image pairs at 256 × 256 resolution, covering **46** heavy flood events between 2015 and 2022 and spanning **6** continents of the world, with a particular focus on developing countries. The following animation shows SAR images before and after the event and a sample of flooded area findings for a rural area in Iran that was hit by a flood in March 2019. The right figure provides an enlarged visual of a 1 km x 1 km area within the larger area as in the yellow box, showing the size of the affected buildings from the flood by our model.
+* [**S1GFloods**](https://www.sciencedirect.com/science/article/abs/pii/S0924271624002168) is the first open-access, globally distributed, event-diverse Sentinel-1 SAR dataset specifically designed to support AI-based flood response applications. The dataset comprises **5,360** image pairs with a spatial size of **256 × 256** pixels, covering **46** major flood events that occurred between **2015** and **2022** across **six** continents, with particular emphasis on developing countries. Its broad geographic and event diversity provides a comprehensive benchmark for developing and evaluating robust flood-mapping models.
 
-- **Training Set**: 4300 image pairs  
+The accompanying animation illustrates pre- and post-event SAR imagery along with sample flood-mapping results for a rural region in Iran affected by severe flooding in **March 2019**. The figure on the right presents a magnified visualization of a **1 km × 1 km** area (highlighted by the yellow box in the larger scene), demonstrating the extent of flood impacts on buildings as identified by our model.
+
+**Dataset Statistics**
+
+- **Training Set**: 4,300 image pairs  
 - **Validation Set**: 530 image pairs  
 - **Testing Set**: 530 image pairs 
 - **Image Size**: 256 × 256 pixels
 - **Spatial Resolution**: 10 meters  
 
-Each image pair consists of the following:
-   - A binary label map manually annotated
-   - Pixel value `0`: background / no flood
-   - Pixel value `255`: newly developed floods
+Each image pair includes:
+   - A manually annotated binary label map
+   - Pixel value `0`: Background / non-flooded area
+   - Pixel value `255`: Newly inundated flood area
 
 
  <p align="center">
