@@ -40,14 +40,14 @@
 - **Spatial Resolution**: 10 meters  
 
 Each image pair consists of the following:
-   - A binary label map manually annotated  
+   - A binary label map manually annotated
    - Pixel value `0`: background / no flood
    - Pixel value `255`: newly developed floods
 
 
  <p align="center">
-  <img src="./images/test-map.gif" width="417.576" height="243.84" />
-  <img src="./images/zoom-test-map.gif" width="243.84" height="243.84" />
+  <img src="./images/test-map.gif" width="521.97" height="304.8" />
+  <img src="./images/zoom-test-map.gif" width="304.8" height="304.8" />
 </p>
 
 
