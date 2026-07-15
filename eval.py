@@ -1,3 +1,5 @@
+import os
+
 from tqdm import tqdm
 import torch.utils.data
 from utils.parser import parser_with_args
@@ -7,9 +9,11 @@ from sklearn.metrics import confusion_matrix
 dev = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 parser, metadata = parser_with_args()
 opt = parser.parse_args()
-opt.dataset_dir = './S1GFloods_example/'
+if not opt.path:
+    parser.error('--path is required for evaluation')
+opt.dataset_dir = os.path.join(os.path.abspath(opt.dataset_dir), '')
 test_loader = get_test_loaders(opt)
-model = torch.load(opt.path, map_location='cpu')
+model = torch.load(opt.path, map_location='cpu', weights_only=False)
 model.to(dev)
 
 CM = {'TN': 0, 'FP': 0, 'FN': 0, 'TP': 0}

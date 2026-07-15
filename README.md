@@ -207,7 +207,9 @@ You can download our novel public S1GFloods dataset through the following link:
 - Testing
 
   ```shell
-  uv run python eval.py --path .tmp/S1GFloods_vitae_rsp/checkpoint_epoch_<N>.pth
+  uv run python eval.py \
+    --dataset-dir /path/to/S1GFloods_prepared \
+    --path .tmp/S1GFloods_vitae_rsp/checkpoint_epoch_<N>.pth
   ```
   
 ## Results
