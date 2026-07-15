@@ -1,0 +1,12 @@
+{
+  "patch_size": 256,
+  "augmentation": true,
+  "num_workers": 4,
+  "num_channel": 3,
+  "epochs": 100,
+  "batch_size": 16,
+  "learning_rate": 0.0001,
+  "loss_function": "hybrid",
+  "dataset_dir": "./S1GFloods/",
+  "weight_dir": "./results/"
+}

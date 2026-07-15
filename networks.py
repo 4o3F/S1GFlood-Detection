@@ -3,14 +3,14 @@ import torch.nn as nn
 from torch.nn import init
 import torch.nn.functional as F
 from torch.optim import lr_scheduler
-from .NormalCell import Mlp
+from NormalCell import Mlp
 from timm.models.layers import trunc_normal_
 import math
 import functools
 from einops import rearrange
-from .resnet import ResNet
-from .base_model import ViTAE_Window_NoShift_basic 
-from .swin_transformer import swin
+from resnet import ResNet
+from base_model import ViTAE_Window_NoShift_basic
+from swin_transformer import swin
 
 
 class TwoLayerConv2d(nn.Sequential):
@@ -389,7 +389,7 @@ class TemporalAwareChangeEnhancement(nn.Module):
             nn.Conv2d(token_dim, token_dim, 3, 1, 1, 1, 1),
         )
         
-        self.i2t = lambda x: rearrange(x, 'b c h w -> b (h w) c')
+        self.i2t = I2T()
         self.MHA = Attention(dim=token_dim, heads=4)
         self.MHA.num_heads = 4 
         self.FFN = Mlp(in_features=token_dim, hidden_features=mlp_hidden_dim) 
@@ -566,12 +566,8 @@ class DAMNet_New(Backbone):
         return x_map, x_token
 
 
-    def forward(self, x):
-        C_single = self.input_nc
-        x1 = x[:, :C_single, :, :]
-        x2 = x[:, C_single:, :, :]
-
-        x1_map = self.forward_single(x1) 
+    def forward(self, x1, x2):
+        x1_map = self.forward_single(x1)
         x2_map = self.forward_single(x2) 
 
         if self.tokenizer:

@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from .token_transformer import Token_transformer
-from .token_performer import Token_performer
-from .SELayer import SELayer
-from .swin import SwinTransformerBlock, window_partition, window_reverse
+from token_transformer import Token_transformer
+from token_performer import Token_performer
+from SELayer import SELayer
+from swin import SwinTransformerBlock, window_partition, window_reverse
 
 class PRM(nn.Module):
     def __init__(self, img_size=224, kernel_size=4, downsample_ratio=4, dilations=[1,6,12], in_chans=3, embed_dim=64, share_weights=False, op='sum'):

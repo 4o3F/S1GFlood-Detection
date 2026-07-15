@@ -1,5 +1,5 @@
 from timm.models.helpers import load_pretrained
-from .base_model import ViTAE_Window_NoShift_basic
+from base_model import ViTAE_Window_NoShift_basic
 
 def _cfg(url='', **kwargs):
     return {

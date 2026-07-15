@@ -3,14 +3,20 @@ import torch.utils.data as data
 from PIL import Image
 from utils import transforms as trans
 
-def train_path(data_dir):
-    train_data = [i for i in os.listdir(data_dir + 'train/A/') if not
-    i.startswith('.')]
-    train_data.sort()
 
-    valid_data = [i for i in os.listdir(data_dir + 'val/A/') if not
-    i.startswith('.')]
-    valid_data.sort()
+_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
+
+
+def _list_images(directory):
+    return sorted(
+        name for name in os.listdir(directory)
+        if not name.startswith('.') and name.lower().endswith(_IMAGE_EXTENSIONS)
+    )
+
+
+def train_path(data_dir):
+    train_data = _list_images(data_dir + 'train/A/')
+    valid_data = _list_images(data_dir + 'val/A/')
 
     train_label_paths = []
     val_label_paths = []
@@ -39,9 +45,7 @@ def train_path(data_dir):
 
 
 def test_path(data_dir):
-    test_data = [i for i in os.listdir(data_dir + 'test/A/') if not
-                    i.startswith('.')]
-    test_data.sort()
+    test_data = _list_images(data_dir + 'test/A/')
 
     test_label_paths = []
     for img in test_data:

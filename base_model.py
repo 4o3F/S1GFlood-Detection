@@ -1,5 +1,6 @@
 from functools import partial
 from pyexpat import model
+import os
 import torch
 import torch.nn as nn
 import warnings
@@ -7,8 +8,8 @@ import torch.nn.functional as F
 from collections import OrderedDict
 import numpy as np
 from torch.nn.modules.batchnorm import BatchNorm2d
-from .NormalCell import NormalCell
-from .ReductionCell import ReductionCell
+from NormalCell import NormalCell
+from ReductionCell import ReductionCell
 
 
 class PatchEmbedding(nn.Module):
@@ -163,8 +164,11 @@ class ViTAE_Window_NoShift_basic(nn.Module):
             raise NotImplementedError
 
         if isinstance(pretrained, str):
+            if not os.path.isfile(pretrained):
+                print('pretrained weights not found, using random initialization: {}'.format(pretrained))
+                return
 
-            ckpt = torch.load(pretrained, map_location='cpu', weights_only=False) 
+            ckpt = torch.load(pretrained, map_location='cpu', weights_only=False)
             if 'state_dict' in ckpt:
                 _state_dict = ckpt['state_dict']
             elif 'state_dict_ema' in ckpt:

@@ -102,6 +102,22 @@
 [![Python-SNAPPY 8.0](https://img.shields.io/badge/PythonSNAPPY-8.0-blue.svg)](https://senbox.atlassian.net/wiki/spaces/SNAP/pages/50855941/Configure+Python+to+use+the+SNAP-Python+snappy+interface)
 [![Wandb 0.13.10](https://img.shields.io/badge/Wandb-0.13.10-blue.svg)](https://pypi.org/project/wandb/)
 
+### Reproducible environment with uv
+
+The checked-in uv environment targets Linux, Python 3.10, and NVIDIA CUDA 12.4. PyTorch wheels are resolved from the Aliyun mirror; all other packages use the TUNA PyPI mirror.
+
+```shell
+uv sync --locked
+```
+
+Verify the CUDA environment:
+
+```shell
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+The repository does not include the optional `PRETRAINED/` backbone weights. When they are absent, the model starts with random initialization.
+
 
 ## Our model
 An overview of the proposed DAM-Net. The feature maps of the pre-and post-event image pairs are extracted through a Siamese structure and pre-trained remote sensing. 
@@ -166,13 +182,13 @@ You can download our novel public S1GFloods dataset through the following link:
 - Training
 
   ```shell
-  python train.py
+  uv run python train.py
   ```
 
 - Testing
 
   ```shell
-  python eval.py
+  uv run python eval.py --path .tmp/S1GFloods_vitae_rsp/checkpoint_epoch_<N>.pth
   ```
   
 ## Results

@@ -1,0 +1,28 @@
+[project]
+name = "s1gflood-detection"
+version = "0.1.0"
+description = "DAM-Net flood detection from Sentinel-1 SAR imagery"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "einops==0.8.1",
+    "mmcv-lite==2.2.0",
+    "numpy>=1.24,<2",
+    "pillow>=9.5,<10",
+    "scikit-learn>=1.3,<1.6",
+    "tensorboardx>=2.6,<3",
+    "timm==0.6.13",
+    "torch==2.5.1+cu124",
+    "torchvision==0.20.1+cu124",
+    "tqdm>=4.66,<5",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux'"]
+find-links = ["https://mirrors.aliyun.com/pytorch-wheels/cu124"]
+
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
