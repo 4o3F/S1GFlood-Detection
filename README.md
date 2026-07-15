@@ -167,6 +167,19 @@ An overview of the proposed DAM-Net. The feature maps of the pre-and post-event 
               │   │       └── <region><year><XY>.png
               │  
 
+If the downloaded dataset contains flat `A/`, `B/`, and `Label/` directories, prepare the required layout with:
+
+```shell
+uv run python prepare_dataset.py \
+  --source /path/to/S1GFloods \
+  --output /path/to/S1GFloods_prepared \
+  --mode copy
+```
+
+The default deterministic split uses seed `42` and creates `4,300` training, `530` validation, and `530` test samples. Use `--dry-run` to validate file pairing before creating output. The generated split is reproducible but is not a substitute for an official benchmark split manifest.
+
+For large datasets, `--mode hardlink` avoids duplicating file data when source and output are on the same filesystem. `--mode symlink` is also available.
+
               
 ## :truck: Datasets <a name="dataset"></a>
 
