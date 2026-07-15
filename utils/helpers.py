@@ -4,13 +4,8 @@ import torch.utils.data
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.dataloaders import train_path, test_path, FloodDetection
-from utils.parser import parser_with_args
 from torch.autograd import Variable
 from networks import DAMNet_New
-
-
-parser, metadata = parser_with_args()
-opt = parser.parse_args()
 
 def get_loaders(opt):
     train_full_load, val_full_load = train_path(opt.dataset_dir)

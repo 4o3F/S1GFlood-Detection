@@ -198,6 +198,18 @@ You can download our novel public S1GFloods dataset through the following link:
   bash train_s1gfloods.sh /path/to/S1GFloods
   ```
 
+  Training runs for at most `1,000` epochs and validates every `10` completed epochs. Checkpoints are saved only when validation F1 improves by more than `0.001`. Training stops after `3` consecutive validation checks without significant improvement.
+
+  ```shell
+  bash train_s1gfloods.sh /path/to/S1GFloods_prepared \
+    --epochs 1000 \
+    --validation-interval 10 \
+    --early-stopping-patience 3 \
+    --min-f1-improvement 0.001
+  ```
+
+  Checkpoint epoch numbers are one-based, for example `checkpoint_epoch_10.pth`.
+
   The dataset directory can also be passed directly to the Python entry point:
 
   ```shell

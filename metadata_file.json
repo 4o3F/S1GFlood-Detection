@@ -3,10 +3,13 @@
   "augmentation": true,
   "num_workers": 4,
   "num_channel": 3,
-  "epochs": 100,
-  "batch_size": 16,
+  "epochs": 1000,
+  "batch_size": 8,
   "learning_rate": 0.0001,
   "loss_function": "hybrid",
+  "validation_interval": 10,
+  "early_stopping_patience": 3,
+  "min_f1_improvement": 0.001,
   "dataset_dir": "./S1GFloods/",
   "weight_dir": "./results/"
 }
