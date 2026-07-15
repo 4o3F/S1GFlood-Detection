@@ -182,7 +182,13 @@ You can download our novel public S1GFloods dataset through the following link:
 - Training
 
   ```shell
-  uv run python train.py
+  bash train_s1gfloods.sh /path/to/S1GFloods
+  ```
+
+  The dataset directory can also be passed directly to the Python entry point:
+
+  ```shell
+  uv run python train.py --dataset-dir /path/to/S1GFloods
   ```
 
 - Testing
