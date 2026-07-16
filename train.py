@@ -50,6 +50,15 @@ def is_significant_improvement(current_f1, best_f1, min_delta):
     return current_f1 > best_f1 + min_delta
 
 
+def should_stop_early(checks_without_improvement, patience):
+    """Return True when early stopping is enabled and patience is exhausted.
+
+    patience <= 0 disables early stopping so full epoch budgets (e.g. paper
+    100-epoch runs) can complete without changing the default workflow.
+    """
+    return patience > 0 and checks_without_improvement >= patience
+
+
 def safe_divide(numerator, denominator):
     return numerator / denominator if denominator else 0.0
 
@@ -155,20 +164,39 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, opt,
     return get_mean_metrics(train_metrics), total_step
 
 
-def build_optimizer(model, backbone):
-    if backbone == 'vitae':
-        return torch.optim.SGD(
-            model.parameters(),
-            lr=0.001,
-            momentum=0.99,
-            weight_decay=0.0005,
-        )
-    return torch.optim.AdamW(
-        model.parameters(),
-        lr=0.00006,
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
-    )
+# DAM-Net paper training uses AdamW for all supported backbones.
+# Keep an explicit SGD path only for optional non-paper experiments.
+ADAMW_DEFAULTS = {
+    'lr': 6e-5,
+    'betas': (0.9, 0.999),
+    'weight_decay': 0.01,
+}
+SGD_DEFAULTS = {
+    'lr': 0.001,
+    'momentum': 0.99,
+    'weight_decay': 0.0005,
+}
+
+
+def resolve_optimizer_type(backbone, optimizer_type=None):
+    """Select optimizer type for DAM-Net training.
+
+    Default is AdamW for every backbone (including vitae). Pass
+    optimizer_type='sgd' only when an explicit SGD experiment is requested.
+    """
+    if optimizer_type is None:
+        return 'adamw'
+    normalized = optimizer_type.lower()
+    if normalized not in {'adamw', 'sgd'}:
+        raise ValueError(f'unsupported optimizer_type: {optimizer_type}')
+    return normalized
+
+
+def build_optimizer(model, backbone, optimizer_type=None):
+    selected = resolve_optimizer_type(backbone, optimizer_type)
+    if selected == 'sgd':
+        return torch.optim.SGD(model.parameters(), **SGD_DEFAULTS)
+    return torch.optim.AdamW(model.parameters(), **ADAMW_DEFAULTS)
 
 
 def main():
@@ -263,7 +291,10 @@ def main():
                     f'{opt.early_stopping_patience}'
                 )
 
-            if checks_without_improvement >= opt.early_stopping_patience:
+            if should_stop_early(
+                checks_without_improvement,
+                opt.early_stopping_patience,
+            ):
                 stop_reason = (
                     f'early stopping after {checks_without_improvement} '
                     'validation checks without significant F1 improvement'

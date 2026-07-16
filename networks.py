@@ -380,7 +380,7 @@ class TemporalAwareChangeEnhancement(nn.Module):
         mlp_hidden_dim = int(token_dim * 4)
 
         self.PCM = nn.Sequential(
-            nn.Conv2d(token_dim, mlp_hidden_dim, 3, 1, 1, 1, 1), 
+            nn.Conv2d(token_dim, mlp_hidden_dim, 3, 1, 1, 1, 1),
             nn.BatchNorm2d(mlp_hidden_dim),
             nn.SiLU(inplace=True),
             nn.Conv2d(mlp_hidden_dim, token_dim, 3, 1, 1, 1, 1),
@@ -388,48 +388,49 @@ class TemporalAwareChangeEnhancement(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(token_dim, token_dim, 3, 1, 1, 1, 1),
         )
-        
+
         self.i2t = I2T()
         self.MHA = Attention(dim=token_dim, heads=4)
-        self.MHA.num_heads = 4 
-        self.FFN = Mlp(in_features=token_dim, hidden_features=mlp_hidden_dim) 
+        self.MHA.num_heads = 4
+        self.FFN = Mlp(in_features=token_dim, hidden_features=mlp_hidden_dim)
         self.norm1 = nn.LayerNorm(token_dim)
-        
+
         if is_last_stage:
             self.class_token = nn.Parameter(torch.zeros(1, 1, token_dim))
             trunc_normal_(self.class_token, std=.02)
+            # Register Q/K/V projections so optimizer and checkpoints track them.
+            self.proj_q = nn.Linear(token_dim, token_dim, bias=False)
+            self.proj_k = nn.Linear(token_dim, token_dim, bias=False)
+            self.proj_v = nn.Linear(token_dim, token_dim, bias=False)
 
     def forward(self, R_i, F_c_i):
-        H, W = self.H, self.W  
-        B, N_c, C = F_c_i.shape 
-        B, N_r, C = R_i.shape 
-    
+        H, W = self.H, self.W
+        B, N_c, C = F_c_i.shape
+        B, N_r, C = R_i.shape
+
         H_short, W_short = int(math.sqrt(N_c)), int(math.sqrt(N_c))
         F_c_map_short = F_c_i.transpose(1, 2).reshape(B, C, H_short, W_short)
         F_c_map = F.interpolate(F_c_map_short, size=(H, W), mode='bilinear', align_corners=False)
-        
+
         F_pcm = self.PCM(F_c_map)
         token_pcm = self.i2t(F_pcm)
-        
+
         t_sem = None
         if self.is_last_stage:
             cls_tokens = self.class_token.expand(B, -1, -1)
-            
-            Q_flat = nn.Linear(C, C, bias=False).to(R_i.device)(R_i) 
-            K_flat = nn.Linear(C, C, bias=False).to(F_c_i.device)(F_c_i) 
-            V_flat = nn.Linear(C, C, bias=False).to(F_c_i.device)(F_c_i)
 
-            if self.is_last_stage:
-                Q_cls = nn.Linear(C, C, bias=False).to(R_i.device)(cls_tokens)
-                Q_flat = torch.cat([Q_cls, Q_flat], dim=1)
+            Q_flat = self.proj_q(R_i)
+            K_flat = self.proj_k(F_c_i)
+            V_flat = self.proj_v(F_c_i)
+            Q_cls = self.proj_q(cls_tokens)
+            Q_flat = torch.cat([Q_cls, Q_flat], dim=1)
 
             attn = torch.matmul(Q_flat, K_flat.transpose(-2, -1)) / (C ** 0.5)
             attn = attn.softmax(dim=-1)
             attn_output = torch.matmul(attn, V_flat)
 
-            if self.is_last_stage:
-                t_sem = attn_output[:, 0]
-                attn_output = attn_output[:, 1:]
+            t_sem = attn_output[:, 0]
+            attn_output = attn_output[:, 1:]
         else:
             attn = torch.matmul(R_i, F_c_i.transpose(-2, -1)) / (C ** 0.5)
             attn = attn.softmax(dim=-1)
@@ -437,7 +438,7 @@ class TemporalAwareChangeEnhancement(nn.Module):
 
         F_tace = attn_output + token_pcm
         F_e_token = self.FFN(self.norm1(F_tace)) + F_tace
-        
+
         F_e_map = F_e_token.transpose(1, 2).reshape(B, C, H, W)
         return F_e_map, t_sem
     
