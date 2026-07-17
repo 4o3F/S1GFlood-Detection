@@ -254,6 +254,14 @@ You can download our novel public S1GFloods dataset through the following link:
     --trust-checkpoint
   ```
 
+  For repeatable GPU-server runs, edit the configuration block at the top of `predict_safe_pair.sh`, then execute:
+
+  ```shell
+  bash predict_safe_pair.sh
+  ```
+
+  The launcher validates all paths, optionally synchronizes the locked uv environment, prints the effective configuration, and saves console output beside the prediction as a `.log` file.
+
   The primary output is a georeferenced `uint8` mask (`0` background, `255` flood). A `float32` flood-probability GeoTIFF is written beside it as `<output>_probability.tif`. Overlapping `256×256` predictions are blended before thresholding, and `tqdm` reports SNAP, inference, and output progress.
 
   The model was trained on VV-like 8-bit grayscale images replicated into three channels, but the paper does not document the exact raw-SAR intensity conversion. Deployment therefore maps calibrated linear Sigma0 through a configurable fixed dB range, `[-25, 0] dB` by default. Adjust `--db-min` and `--db-max` only when a validated preprocessing recipe is available. Inputs are not divided by 255 or ImageNet-normalized.
