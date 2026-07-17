@@ -1,7 +1,11 @@
 import argparse
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -10,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Iterator
+from typing import Callable, Iterator
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -28,6 +32,12 @@ PATCH_SIZE = 256
 MAX_BATCH_SIZE = 64
 FLOOD_CLASS_INDEX = 1
 PROBABILITY_NODATA = -9999.0
+SNAP_CACHE_SCHEMA_VERSION = 2
+SNAP_CACHE_RASTER_NAME = "sigma0_vv.tif"
+SNAP_CACHE_META_NAME = "meta.json"
+SNAP_CACHE_COMPLETE_NAME = ".complete"
+SNAP_CACHE_CURRENT_NAME = "current"
+SNAP_CACHE_GENERATIONS_NAME = "generations"
 PERCENT_RE = re.compile(r"(?<!\d)(100|\d{1,2})(?:\.\d+)?%")
 PRODUCT_NAME_RE = re.compile(
     r"^(?P<platform>S1[AB])_(?P<mode>[A-Z0-9]+)_"
@@ -241,6 +251,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-dir",
         help="Parent directory for SNAP intermediates and disk accumulators",
     )
+    parser.add_argument(
+        "--snap-cache-dir",
+        help=(
+            "Persistent SNAP Sigma0 cache root (default: SNAP_CACHE_DIR or "
+            "<work-dir>/snap-cache)"
+        ),
+    )
+    parser.add_argument(
+        "--no-snap-cache",
+        action="store_true",
+        help="Disable persistent SNAP preprocessing cache",
+    )
+    parser.add_argument(
+        "--refresh-snap-cache",
+        action="store_true",
+        help="Recompute and replace matching SNAP cache entries",
+    )
     parser.add_argument("--keep-intermediate", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -266,6 +293,25 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         raise InferenceError("--db-min must be smaller than --db-max.")
     if not math.isfinite(args.pixel_spacing) or args.pixel_spacing <= 0:
         raise InferenceError("--pixel-spacing must be finite and positive.")
+
+    snap_cache_dir = getattr(args, "snap_cache_dir", None)
+    no_snap_cache = getattr(args, "no_snap_cache", False)
+    refresh_snap_cache = getattr(args, "refresh_snap_cache", False)
+    work_dir = getattr(args, "work_dir", None)
+    env_cache_dir = os.environ.get("SNAP_CACHE_DIR")
+    if no_snap_cache and snap_cache_dir:
+        raise InferenceError(
+            "--no-snap-cache cannot be combined with --snap-cache-dir."
+        )
+    if no_snap_cache and refresh_snap_cache:
+        raise InferenceError(
+            "--no-snap-cache cannot be combined with --refresh-snap-cache."
+        )
+    if refresh_snap_cache and not (snap_cache_dir or env_cache_dir or work_dir):
+        raise InferenceError(
+            "--refresh-snap-cache requires --snap-cache-dir, SNAP_CACHE_DIR, "
+            "or --work-dir."
+        )
 
 
 def resolve_output_paths(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -321,6 +367,18 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return datetime.strptime(value, "%Y%m%dT%H%M%S")
     except ValueError:
         return None
+
+
+def _is_vv_measurement(path: Path) -> bool:
+    name = path.name.lower()
+    return (
+        "-vv-" in name
+        or "_vv_" in name
+        or name.endswith("-vv.tif")
+        or name.endswith("-vv.tiff")
+        or name.endswith("_vv.tif")
+        or name.endswith("_vv.tiff")
+    )
 
 
 def resolve_safe_product(path_value: str) -> SafeProduct:
@@ -399,14 +457,7 @@ def resolve_safe_product(path_value: str) -> SafeProduct:
     if not measurement_dir.is_dir():
         raise InferenceError(f"Missing SAFE measurement directory: {measurement_dir}")
     measurement_files = [item for item in measurement_dir.iterdir() if item.is_file()]
-    vv_measurements = [
-        item
-        for item in measurement_files
-        if "-vv-" in item.name.lower()
-        or "_vv_" in item.name.lower()
-        or item.name.lower().endswith("_vv.tif")
-        or item.name.lower().endswith("_vv.tiff")
-    ]
+    vv_measurements = [item for item in measurement_files if _is_vv_measurement(item)]
     if not vv_measurements:
         raise InferenceError(
             f"No VV measurement GeoTIFF was found in {measurement_dir}."
@@ -561,6 +612,357 @@ def run_gpt(command: list[str], log_path: Path, description: str) -> None:
         )
 
 
+def validate_sigma0_raster(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise InferenceError(f"SNAP did not create the expected raster: {path}")
+
+    with rasterio.open(path) as dataset:
+        AlignedRasterPair._validate_source(dataset, "SNAP output")
+        description = (dataset.descriptions[0] or "").upper().replace("-", "_")
+        if description and "SIGMA0_VV" not in description:
+            raise InferenceError(
+                f"Unexpected SNAP output band '{dataset.descriptions[0]}'; "
+                "expected linear Sigma0_VV."
+            )
+        sample_height = min(dataset.height, 1024)
+        sample_width = min(dataset.width, 1024)
+        sample = dataset.read(
+            1,
+            out_shape=(sample_height, sample_width),
+            out_dtype="float32",
+            resampling=Resampling.nearest,
+        )
+        if not np.any(np.isfinite(sample) & (sample > 0)):
+            raise InferenceError(
+                f"SNAP output has no finite positive Sigma0 samples: {path}"
+            )
+
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sampled_sha256_file(path: Path, sample_size: int = 1024 * 1024) -> str:
+    size = path.stat().st_size
+    digest = hashlib.sha256(str(size).encode("ascii"))
+    offsets = {
+        0,
+        max(0, (size - sample_size) // 2),
+        max(0, size - sample_size),
+    }
+    with path.open("rb") as source:
+        for offset in sorted(offsets):
+            source.seek(offset)
+            digest.update(offset.to_bytes(8, "big"))
+            digest.update(source.read(sample_size))
+    return digest.hexdigest()
+
+
+def _safe_source_inventory(product: SafeProduct) -> list[dict[str, object]]:
+    inventory: list[dict[str, object]] = []
+    measurement_dir = product.root / "measurement"
+    annotation_dir = product.root / "annotation"
+
+    if measurement_dir.is_dir():
+        for path in sorted(measurement_dir.rglob("*")):
+            if path.is_file() and _is_vv_measurement(path):
+                inventory.append(
+                    {
+                        "path": path.relative_to(product.root).as_posix(),
+                        "size": path.stat().st_size,
+                        "sample_sha256": _sampled_sha256_file(path),
+                    }
+                )
+
+    if annotation_dir.is_dir():
+        for path in sorted(annotation_dir.rglob("*")):
+            if path.is_file():
+                inventory.append(
+                    {
+                        "path": path.relative_to(product.root).as_posix(),
+                        "size": path.stat().st_size,
+                        "sha256": _sha256_file(path),
+                    }
+                )
+    return inventory
+
+
+def _sanitize_cache_component(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    return sanitized or "product"
+
+
+def build_snap_cache_key(
+    product: SafeProduct,
+    graph: Path,
+    gpt: str,
+    args: argparse.Namespace,
+) -> tuple[str, dict[str, object]]:
+    gpt_path = Path(gpt).resolve()
+    inputs: dict[str, object] = {
+        "schema_version": SNAP_CACHE_SCHEMA_VERSION,
+        "product_identifier": product.identifier,
+        "manifest_sha256": _sha256_file(product.manifest),
+        "safe_source_inventory": _safe_source_inventory(product),
+        "graph_sha256": _sha256_file(graph),
+        "gpt_path": str(gpt_path),
+        "gpt_sha256": _sha256_file(gpt_path),
+        "orbit_type": args.orbit_type,
+        "dem_name": args.dem_name,
+        "target_crs": args.target_crs,
+        "pixel_spacing": format(float(args.pixel_spacing), ".12g"),
+    }
+    serialized = json.dumps(
+        inputs,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest(), inputs
+
+
+def resolve_snap_cache_root(
+    args: argparse.Namespace,
+    work_parent: Path,
+) -> Path | None:
+    if getattr(args, "no_snap_cache", False):
+        return None
+    configured = getattr(args, "snap_cache_dir", None) or os.environ.get(
+        "SNAP_CACHE_DIR"
+    )
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if getattr(args, "work_dir", None):
+        return (work_parent / "snap-cache").resolve()
+    return None
+
+
+def _snap_cache_entry_dir(
+    cache_root: Path,
+    product: SafeProduct,
+    cache_key: str,
+) -> Path:
+    product_id = _sanitize_cache_component(product.identifier)
+    return cache_root / "entries" / product_id / cache_key
+
+
+@contextmanager
+def snap_cache_lock(cache_root: Path, cache_key: str):
+    lock_dir = cache_root / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{cache_key}.lock"
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _resolve_snap_cache_generation(entry_dir: Path) -> Path | None:
+    current_path = entry_dir / SNAP_CACHE_CURRENT_NAME
+    if current_path.is_symlink():
+        try:
+            generation = current_path.resolve(strict=True)
+            generations_dir = (
+                entry_dir / SNAP_CACHE_GENERATIONS_NAME
+            ).resolve(strict=True)
+            generation.relative_to(generations_dir)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return generation if generation.is_dir() else None
+    if current_path.exists():
+        return None
+    return entry_dir
+
+
+def load_snap_cache_entry(
+    entry_dir: Path,
+    expected_key: str,
+    expected_inputs: dict[str, object],
+) -> Path | None:
+    generation = _resolve_snap_cache_generation(entry_dir)
+    if generation is None:
+        return None
+
+    complete_path = generation / SNAP_CACHE_COMPLETE_NAME
+    meta_path = generation / SNAP_CACHE_META_NAME
+    raster_path = generation / SNAP_CACHE_RASTER_NAME
+    if not complete_path.is_file() or not meta_path.is_file():
+        return None
+    if not raster_path.is_file() or raster_path.stat().st_size == 0:
+        return None
+
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            return None
+        if metadata.get("schema_version") != SNAP_CACHE_SCHEMA_VERSION:
+            return None
+        if metadata.get("cache_key") != expected_key:
+            return None
+        if metadata.get("inputs") != expected_inputs:
+            return None
+        if metadata.get("raster_size") != raster_path.stat().st_size:
+            return None
+        validate_sigma0_raster(raster_path)
+    except (
+        InferenceError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        rasterio.errors.RasterioError,
+    ):
+        return None
+    return raster_path
+
+
+def _unused_path(parent: Path, prefix: str) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix=prefix, dir=parent)
+    os.close(descriptor)
+    path = Path(raw_path)
+    path.unlink()
+    return path
+
+
+def _quarantine_cache_path(path: Path, prefix: str) -> None:
+    quarantine = _unused_path(path.parent, prefix)
+    os.replace(path, quarantine)
+
+
+def install_snap_cache_entry(
+    cache_root: Path,
+    entry_dir: Path,
+    cache_key: str,
+    inputs: dict[str, object],
+    build: Callable[[Path], None],
+) -> Path:
+    cache_root.mkdir(parents=True, exist_ok=True)
+    entry_dir.parent.mkdir(parents=True, exist_ok=True)
+    if entry_dir.is_symlink() or (
+        entry_dir.exists() and not entry_dir.is_dir()
+    ):
+        _quarantine_cache_path(entry_dir, f".invalid-{cache_key}-")
+    entry_dir.mkdir(parents=True, exist_ok=True)
+
+    generations_dir = entry_dir / SNAP_CACHE_GENERATIONS_NAME
+    generations_dir.mkdir(parents=True, exist_ok=True)
+    partial_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".partial-{cache_key}-",
+            dir=generations_dir,
+        )
+    )
+    current_temp: Path | None = None
+    try:
+        raster_path = partial_dir / SNAP_CACHE_RASTER_NAME
+        build(raster_path)
+        validate_sigma0_raster(raster_path)
+        metadata = {
+            "schema_version": SNAP_CACHE_SCHEMA_VERSION,
+            "cache_key": cache_key,
+            "inputs": inputs,
+            "raster_size": raster_path.stat().st_size,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        (partial_dir / SNAP_CACHE_META_NAME).write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (partial_dir / SNAP_CACHE_COMPLETE_NAME).touch()
+
+        generation_dir = generations_dir / partial_dir.name.replace(
+            ".partial-", "generation-", 1
+        )
+        os.replace(partial_dir, generation_dir)
+
+        current_path = entry_dir / SNAP_CACHE_CURRENT_NAME
+        if current_path.exists() and not current_path.is_symlink():
+            _quarantine_cache_path(current_path, ".invalid-current-")
+        current_temp = _unused_path(entry_dir, ".current-")
+        target = Path(SNAP_CACHE_GENERATIONS_NAME) / generation_dir.name
+        os.symlink(target, current_temp)
+        os.replace(current_temp, current_path)
+        current_temp = None
+        return generation_dir / SNAP_CACHE_RASTER_NAME
+    finally:
+        if partial_dir.exists():
+            shutil.rmtree(partial_dir)
+        if current_temp is not None and current_temp.is_symlink():
+            current_temp.unlink()
+
+
+def get_or_create_sigma0(
+    gpt: str,
+    graph: Path,
+    product: SafeProduct,
+    output: Path,
+    args: argparse.Namespace,
+    label: str,
+    cache_root: Path | None,
+    refresh: bool,
+    build: Callable[[Path], None] | None = None,
+) -> Path:
+    if build is None:
+        def builder(path: Path) -> None:
+            try:
+                preprocess_safe(gpt, graph, product, path, args, label)
+            except Exception as exc:
+                cache_log = path.with_suffix(".snap.log")
+                run_log = output.with_suffix(".snap.log")
+                if cache_log.is_file() and cache_log != run_log:
+                    try:
+                        run_log.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(cache_log, run_log)
+                    except OSError as copy_error:
+                        raise InferenceError(
+                            f"{exc}\nFailed to preserve SNAP log at {run_log}: "
+                            f"{copy_error}"
+                        ) from exc
+                    raise InferenceError(
+                        f"{exc}\nSNAP failure log preserved at: {run_log}"
+                    ) from exc
+                raise
+    else:
+        builder = build
+
+    if cache_root is None:
+        builder(output)
+        return output
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_key, inputs = build_snap_cache_key(product, graph, gpt, args)
+    entry_dir = _snap_cache_entry_dir(cache_root, product, cache_key)
+    if not refresh:
+        cached = load_snap_cache_entry(entry_dir, cache_key, inputs)
+        if cached is not None:
+            print(f"SNAP cache hit ({label}): {cached}")
+            return cached
+        print(f"SNAP cache miss ({label}): {entry_dir}")
+    else:
+        print(f"SNAP cache refresh ({label}): {entry_dir}")
+
+    with snap_cache_lock(cache_root, cache_key):
+        if not refresh:
+            cached = load_snap_cache_entry(entry_dir, cache_key, inputs)
+            if cached is not None:
+                print(f"SNAP cache hit after wait ({label}): {cached}")
+                return cached
+        cached = install_snap_cache_entry(
+            cache_root,
+            entry_dir,
+            cache_key,
+            inputs,
+            builder,
+        )
+        print(f"SNAP cache installed ({label}): {cached}")
+        return cached
+
+
 def preprocess_safe(
     gpt: str,
     graph: Path,
@@ -588,32 +990,7 @@ def preprocess_safe(
                 "or obtain the original SAFE product, then rerun inference."
             ) from exc
         raise
-    if not output.is_file() or output.stat().st_size == 0:
-        raise InferenceError(f"SNAP did not create the expected raster: {output}")
-
-    with rasterio.open(output) as dataset:
-        if dataset.count != 1:
-            raise InferenceError(
-                f"SNAP output must contain one Sigma0_VV band, found {dataset.count}."
-            )
-        description = (dataset.descriptions[0] or "").upper().replace("-", "_")
-        if description and "SIGMA0_VV" not in description:
-            raise InferenceError(
-                f"Unexpected SNAP output band '{dataset.descriptions[0]}'; "
-                "expected linear Sigma0_VV."
-            )
-        sample_height = min(dataset.height, 1024)
-        sample_width = min(dataset.width, 1024)
-        sample = dataset.read(
-            1,
-            out_shape=(sample_height, sample_width),
-            out_dtype="float32",
-            resampling=Resampling.nearest,
-        )
-        if not np.any(np.isfinite(sample) & (sample > 0)):
-            raise InferenceError(
-                f"SNAP output has no finite positive Sigma0 samples: {output}"
-            )
+    validate_sigma0_raster(output)
 
 
 def sigma0_to_model_intensity(
@@ -1162,13 +1539,36 @@ def main(argv: list[str] | None = None) -> int:
             else Path(tempfile.gettempdir())
         )
         work_parent.mkdir(parents=True, exist_ok=True)
+        cache_root = resolve_snap_cache_root(args, work_parent)
+        if cache_root is None:
+            print("SNAP cache: disabled")
+        else:
+            cache_root.mkdir(parents=True, exist_ok=True)
+            print(f"SNAP cache: {cache_root}")
+
         run_dir = Path(tempfile.mkdtemp(prefix="damnet-safe-", dir=work_parent))
         print(f"Working directory: {run_dir}")
 
-        pre_raster = run_dir / "pre_sigma0_vv.tif"
-        post_raster = run_dir / "post_sigma0_vv.tif"
-        preprocess_safe(gpt, graph, pre, pre_raster, args, "pre-event")
-        preprocess_safe(gpt, graph, post, post_raster, args, "post-event")
+        pre_raster = get_or_create_sigma0(
+            gpt,
+            graph,
+            pre,
+            run_dir / "pre_sigma0_vv.tif",
+            args,
+            "pre-event",
+            cache_root,
+            args.refresh_snap_cache,
+        )
+        post_raster = get_or_create_sigma0(
+            gpt,
+            graph,
+            post,
+            run_dir / "post_sigma0_vv.tif",
+            args,
+            "post-event",
+            cache_root,
+            args.refresh_snap_cache,
+        )
 
         model = load_trusted_model(checkpoint, device)
         with AlignedRasterPair(pre_raster, post_raster) as pair:

@@ -5,14 +5,15 @@ set -Eeuo pipefail
 # User configuration: edit values in this section before running the script.
 # =============================================================================
 readonly PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly DATA_ROOT="${HOME}/data/kazakhstan_flood_2024_sar_urgent/products_kulsary_orbit159"
-readonly OUTPUT_DIR="${HOME}/results/kulsary_orbit159"
+readonly DATA_ROOT="/home/ubuntu/lhx/Sentinel1-SAR/restored_grd"
+readonly OUTPUT_DIR="/home/ubuntu/lhx/Sentinel1-SAR/restored_grd/predicted"
 readonly WORK_DIR="${HOME}/scratch/damnet-safe"
+readonly SNAP_CACHE_DIR="${WORK_DIR}/snap-cache"
 readonly SNAP_GPT="/usr/local/esa-snap/bin/gpt"
-readonly CHECKPOINT_PATH="/path/to/current/checkpoint_epoch_N.pth"
+readonly CHECKPOINT_PATH="/home/ubuntu/lhx/DAM-Net/.tmp/S1GFloods_vitae_rsp/checkpoint_epoch_60.pth"
 
-readonly PRE_SAFE_NAME="S1A_IW_GRDH_1SDV_20240402T141444_20240402T141510_053256_06745E_D77F_COG.SAFE"
-readonly POST_SAFE_NAME="S1A_IW_GRDH_1SDV_20240414T141444_20240414T141509_053431_067B51_2A05_COG.SAFE"
+readonly PRE_SAFE_NAME="S1A_IW_GRDH_1SDV_20240402T141444_20240402T141510_053256_06745E_5249.SAFE"
+readonly POST_SAFE_NAME="S1A_IW_GRDH_1SDV_20240414T141444_20240414T141509_053431_067B51_75FD.SAFE"
 readonly OUTPUT_NAME="kulsary_flood_20240414.tif"
 
 readonly TARGET_CRS="EPSG:32639"
@@ -28,6 +29,8 @@ readonly THRESHOLD="0.5"
 readonly KEEP_INTERMEDIATE="false"
 readonly OVERWRITE="false"
 readonly SYNC_ENVIRONMENT="false"
+readonly USE_SNAP_CACHE="true"
+readonly REFRESH_SNAP_CACHE="false"
 # =============================================================================
 
 readonly PRE_SAFE_PATH="${DATA_ROOT}/${PRE_SAFE_NAME}"
@@ -58,13 +61,26 @@ command -v uv >/dev/null 2>&1 || fail "uv is not installed or not in PATH."
 validate_boolean "KEEP_INTERMEDIATE" "$KEEP_INTERMEDIATE"
 validate_boolean "OVERWRITE" "$OVERWRITE"
 validate_boolean "SYNC_ENVIRONMENT" "$SYNC_ENVIRONMENT"
+validate_boolean "USE_SNAP_CACHE" "$USE_SNAP_CACHE"
+validate_boolean "REFRESH_SNAP_CACHE" "$REFRESH_SNAP_CACHE"
+if [[ "$REFRESH_SNAP_CACHE" == "true" && "$USE_SNAP_CACHE" != "true" ]]; then
+    fail "REFRESH_SNAP_CACHE requires USE_SNAP_CACHE=true."
+fi
 
 mkdir -p "$OUTPUT_DIR" "$WORK_DIR"
+if [[ "$USE_SNAP_CACHE" == "true" ]]; then
+    mkdir -p "$SNAP_CACHE_DIR"
+fi
 cd "$PROJECT_DIR"
 
 if [[ "$SYNC_ENVIRONMENT" == "true" ]]; then
     printf 'Synchronizing the locked Python environment...\n'
     uv sync --locked
+fi
+
+snap_cache_display="disabled"
+if [[ "$USE_SNAP_CACHE" == "true" ]]; then
+    snap_cache_display="$SNAP_CACHE_DIR"
 fi
 
 printf '\nDAM-Net SAFE inference configuration\n'
@@ -75,6 +91,8 @@ printf '  Checkpoint:    %s\n' "$CHECKPOINT_PATH"
 printf '  Flood map:     %s\n' "$OUTPUT_PATH"
 printf '  Probability:   %s\n' "${OUTPUT_PATH%.*}_probability.${OUTPUT_PATH##*.}"
 printf '  Work dir:      %s\n' "$WORK_DIR"
+printf '  SNAP cache:    %s\n' "$snap_cache_display"
+printf '  Cache refresh: %s\n' "$REFRESH_SNAP_CACHE"
 printf '  SNAP gpt:      %s\n' "$SNAP_GPT"
 printf '  Device:        %s\n' "$DEVICE"
 printf '  Log:           %s\n\n' "$LOG_PATH"
@@ -98,6 +116,14 @@ command=(
     --trust-checkpoint
 )
 
+if [[ "$USE_SNAP_CACHE" == "true" ]]; then
+    command+=(--snap-cache-dir "$SNAP_CACHE_DIR")
+else
+    command+=(--no-snap-cache)
+fi
+if [[ "$REFRESH_SNAP_CACHE" == "true" ]]; then
+    command+=(--refresh-snap-cache)
+fi
 if [[ "$KEEP_INTERMEDIATE" == "true" ]]; then
     command+=(--keep-intermediate)
 fi

@@ -1,8 +1,11 @@
 import argparse
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import rasterio
@@ -19,14 +22,18 @@ from infer_safe import (
     SafeProduct,
     axis_starts,
     build_gpt_command,
+    build_snap_cache_key,
+    get_or_create_sigma0,
     make_blend_kernel,
     prepare_model_tile,
     resolve_safe_product,
+    resolve_snap_cache_root,
     run_sliding_inference,
     sigma0_to_model_intensity,
     validate_checkpoint_compatibility,
     validate_cli_args,
     validate_safe_pair,
+    validate_sigma0_raster,
     write_outputs,
 )
 
@@ -99,6 +106,10 @@ class CliValidationTest(unittest.TestCase):
             "db_min": -25.0,
             "db_max": 0.0,
             "pixel_spacing": 10.0,
+            "snap_cache_dir": None,
+            "no_snap_cache": False,
+            "refresh_snap_cache": False,
+            "work_dir": None,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -120,6 +131,40 @@ class CliValidationTest(unittest.TestCase):
     def test_rejects_unbounded_batch_size(self):
         with self.assertRaisesRegex(InferenceError, "between 1 and 64"):
             validate_cli_args(self._args(batch_size=65))
+
+    def test_rejects_conflicting_cache_options(self):
+        with self.assertRaisesRegex(InferenceError, "cannot be combined"):
+            validate_cli_args(
+                self._args(no_snap_cache=True, snap_cache_dir="/tmp/cache")
+            )
+        with self.assertRaisesRegex(InferenceError, "cannot be combined"):
+            validate_cli_args(
+                self._args(no_snap_cache=True, refresh_snap_cache=True)
+            )
+        with mock.patch.dict(os.environ, {"SNAP_CACHE_DIR": ""}):
+            with self.assertRaisesRegex(InferenceError, "requires"):
+                validate_cli_args(self._args(refresh_snap_cache=True))
+
+    def test_no_cache_overrides_environment_default(self):
+        args = self._args(no_snap_cache=True)
+        with mock.patch.dict(
+            os.environ,
+            {"SNAP_CACHE_DIR": "/tmp/environment-cache"},
+        ):
+            validate_cli_args(args)
+            self.assertIsNone(resolve_snap_cache_root(args, Path("/tmp/work")))
+
+    def test_refresh_accepts_environment_cache_directory(self):
+        args = self._args(refresh_snap_cache=True)
+        with mock.patch.dict(
+            os.environ,
+            {"SNAP_CACHE_DIR": "/tmp/environment-cache"},
+        ):
+            validate_cli_args(args)
+            self.assertEqual(
+                resolve_snap_cache_root(args, Path("/tmp/work")),
+                Path("/tmp/environment-cache").resolve(),
+            )
 
 
 class IntensityConversionTest(unittest.TestCase):
@@ -287,6 +332,368 @@ class SafeMetadataTest(unittest.TestCase):
         )
         self.assertIn("-Pinput=/tmp/pre product.SAFE/manifest.safe", command)
         self.assertIn("-Poutput=/tmp/output file.tif", command)
+
+
+class SnapCacheTest(unittest.TestCase):
+    @staticmethod
+    def _args(**overrides):
+        values = {
+            "orbit_type": "Sentinel Precise (Auto Download)",
+            "dem_name": "Copernicus 30m Global DEM",
+            "target_crs": "EPSG:32639",
+            "pixel_spacing": 10.0,
+            "checkpoint": "/tmp/checkpoint-a.pth",
+            "stride": 128,
+            "batch_size": 4,
+            "device": "cuda:0",
+            "db_min": -25.0,
+            "db_max": 0.0,
+            "threshold": 0.5,
+            "snap_cache_dir": None,
+            "no_snap_cache": False,
+            "refresh_snap_cache": False,
+            "work_dir": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    @staticmethod
+    def _product(directory, identifier="S1A_TEST_GRD_20240402T000000.SAFE"):
+        root = Path(directory) / identifier
+        root.mkdir(parents=True)
+        manifest = root / "manifest.safe"
+        manifest.write_text("<manifest>one</manifest>", encoding="utf-8")
+        measurement = root / "measurement" / "scene-vv-test.tiff"
+        measurement.parent.mkdir()
+        measurement.write_bytes(b"measurement-one")
+        annotation = root / "annotation" / "scene.xml"
+        annotation.parent.mkdir()
+        annotation.write_text("<annotation>one</annotation>", encoding="utf-8")
+        return SafeProduct(
+            root=root,
+            manifest=manifest,
+            identifier=identifier,
+            platform="S1A",
+            product_type="GRD",
+            acquisition_mode="IW",
+            start_time=datetime(2024, 4, 2, tzinfo=timezone.utc),
+            stop_time=None,
+            orbit_direction="DESCENDING",
+            relative_orbit=159,
+            polarizations=frozenset({"VV"}),
+        )
+
+    @staticmethod
+    def _write_sigma0(path, value=1.0):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=16,
+            height=16,
+            count=1,
+            dtype="float32",
+            crs="EPSG:32639",
+            transform=from_origin(500000, 5200000, 10, 10),
+            nodata=0.0,
+        ) as dataset:
+            dataset.write(np.full((16, 16), value, dtype=np.float32), 1)
+            dataset.set_band_description(1, "Sigma0_VV")
+
+    def _cache_fixture(self, directory):
+        product = self._product(directory)
+        graph = Path(directory) / "graph.xml"
+        graph.write_text("<graph version='one'/>", encoding="utf-8")
+        gpt = Path(directory) / "gpt"
+        gpt.write_text("launcher-one", encoding="utf-8")
+        return product, graph, gpt
+
+    def test_cache_key_ignores_inference_only_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            args = self._args()
+            first, _ = build_snap_cache_key(product, graph, str(gpt), args)
+            args.checkpoint = "/tmp/checkpoint-b.pth"
+            args.stride = 64
+            args.batch_size = 1
+            args.device = "cpu"
+            args.db_min = -30.0
+            args.db_max = 5.0
+            args.threshold = 0.8
+            second, _ = build_snap_cache_key(product, graph, str(gpt), args)
+            self.assertEqual(first, second)
+
+    def test_cache_key_changes_with_preprocessing_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            base_args = self._args()
+            base, _ = build_snap_cache_key(product, graph, str(gpt), base_args)
+
+            for name, value in (
+                ("orbit_type", "Sentinel Restituted (Auto Download)"),
+                ("dem_name", "SRTM 1Sec HGT"),
+                ("target_crs", "EPSG:4326"),
+                ("pixel_spacing", 20.0),
+            ):
+                changed_args = self._args(**{name: value})
+                changed, _ = build_snap_cache_key(
+                    product,
+                    graph,
+                    str(gpt),
+                    changed_args,
+                )
+                with self.subTest(name=name):
+                    self.assertNotEqual(base, changed)
+
+            graph.write_text("<graph version='two'/>", encoding="utf-8")
+            changed, _ = build_snap_cache_key(product, graph, str(gpt), base_args)
+            self.assertNotEqual(base, changed)
+
+            graph.write_text("<graph version='one'/>", encoding="utf-8")
+            product.manifest.write_text("<manifest>two</manifest>", encoding="utf-8")
+            changed, _ = build_snap_cache_key(product, graph, str(gpt), base_args)
+            self.assertNotEqual(base, changed)
+
+            product.manifest.write_text("<manifest>one</manifest>", encoding="utf-8")
+            gpt.write_text("launcher-two-with-new-size", encoding="utf-8")
+            changed, _ = build_snap_cache_key(product, graph, str(gpt), base_args)
+            self.assertNotEqual(base, changed)
+
+    def test_cache_key_changes_when_safe_payload_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            args = self._args()
+            base, _ = build_snap_cache_key(product, graph, str(gpt), args)
+
+            preview = product.root / "preview" / "notes.txt"
+            preview.parent.mkdir()
+            preview.write_text("not used by SNAP", encoding="utf-8")
+            unchanged, _ = build_snap_cache_key(product, graph, str(gpt), args)
+            self.assertEqual(base, unchanged)
+
+            annotation = product.root / "annotation" / "scene.xml"
+            annotation.write_text("<annotation>two</annotation>", encoding="utf-8")
+            changed, _ = build_snap_cache_key(product, graph, str(gpt), args)
+            self.assertNotEqual(base, changed)
+
+            annotation.write_text("<annotation>one</annotation>", encoding="utf-8")
+            measurement = product.root / "measurement" / "scene-vv-test.tiff"
+            stat = measurement.stat()
+            measurement.write_bytes(b"measurement-two")
+            os.utime(
+                measurement,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns),
+            )
+            changed, _ = build_snap_cache_key(product, graph, str(gpt), args)
+            self.assertNotEqual(base, changed)
+
+    def test_cache_miss_installs_and_second_call_hits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            cache_root = Path(directory) / "cache"
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            calls = 0
+
+            def build(path):
+                nonlocal calls
+                calls += 1
+                self._write_sigma0(path)
+
+            first = get_or_create_sigma0(
+                str(gpt),
+                graph,
+                product,
+                run_dir / "pre_sigma0_vv.tif",
+                self._args(),
+                "pre-event",
+                cache_root,
+                False,
+                build,
+            )
+            second = get_or_create_sigma0(
+                str(gpt),
+                graph,
+                product,
+                run_dir / "pre_sigma0_vv.tif",
+                self._args(),
+                "pre-event",
+                cache_root,
+                False,
+                build,
+            )
+
+            self.assertEqual(calls, 1)
+            self.assertEqual(first, second)
+            self.assertTrue((first.parent / ".complete").is_file())
+            self.assertTrue((first.parent / "meta.json").is_file())
+            self.assertTrue((first.parent.parent.parent / "current").is_symlink())
+            self.assertEqual(list(cache_root.rglob(".partial-*")), [])
+
+    def test_incomplete_entry_and_refresh_force_rebuild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            cache_root = Path(directory) / "cache"
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            calls = 0
+
+            def build(path):
+                nonlocal calls
+                calls += 1
+                self._write_sigma0(path, value=float(calls))
+
+            cached = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                self._args(), "pre-event", cache_root, False, build,
+            )
+            (cached.parent / ".complete").unlink()
+            rebuilt = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                self._args(), "pre-event", cache_root, False, build,
+            )
+            refreshed = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                self._args(), "pre-event", cache_root, True, build,
+            )
+
+            self.assertEqual(calls, 3)
+            self.assertNotEqual(rebuilt, refreshed)
+            self.assertTrue(rebuilt.is_file())
+            self.assertEqual(
+                (refreshed.parent.parent.parent / "current").resolve(),
+                refreshed.parent,
+            )
+            validate_sigma0_raster(refreshed)
+
+    def test_corrupt_metadata_rebuilds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            cache_root = Path(directory) / "cache"
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            calls = 0
+
+            def build(path):
+                nonlocal calls
+                calls += 1
+                self._write_sigma0(path, value=float(calls))
+
+            first = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                self._args(), "pre-event", cache_root, False, build,
+            )
+            (first.parent / "meta.json").write_text("{", encoding="utf-8")
+            rebuilt = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                self._args(), "pre-event", cache_root, False, build,
+            )
+
+            self.assertEqual(calls, 2)
+            self.assertNotEqual(first, rebuilt)
+            validate_sigma0_raster(rebuilt)
+
+    def test_failed_refresh_keeps_previous_generation_visible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            cache_root = Path(directory) / "cache"
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            args = self._args()
+            original = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                args, "pre-event", cache_root, False, self._write_sigma0,
+            )
+            real_replace = os.replace
+
+            def fail_current_publication(source, destination):
+                if Path(destination).name == "current":
+                    raise OSError("simulated publication failure")
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "infer_safe.os.replace",
+                side_effect=fail_current_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "publication failure"):
+                    get_or_create_sigma0(
+                        str(gpt), graph, product, run_dir / "pre.tif",
+                        args, "pre-event", cache_root, True,
+                        self._write_sigma0,
+                    )
+
+            reused = get_or_create_sigma0(
+                str(gpt), graph, product, run_dir / "pre.tif",
+                args, "pre-event", cache_root, False,
+                lambda path: self.fail("cache should remain readable"),
+            )
+            self.assertEqual(reused, original)
+            validate_sigma0_raster(reused)
+
+    def test_failure_log_is_preserved_outside_partial_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            cache_root = Path(directory) / "cache"
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            output = run_dir / "pre_sigma0_vv.tif"
+            run_log = output.with_suffix(".snap.log")
+
+            def fail_preprocess(gpt_arg, graph_arg, product_arg, path, args, label):
+                cache_log = path.with_suffix(".snap.log")
+                cache_log.write_text("SNAP failed\n", encoding="utf-8")
+                raise InferenceError(f"SNAP failed. Log: {cache_log}")
+
+            with mock.patch(
+                "infer_safe.preprocess_safe",
+                side_effect=fail_preprocess,
+            ):
+                with self.assertRaisesRegex(
+                    InferenceError,
+                    re.escape(str(run_log)),
+                ):
+                    get_or_create_sigma0(
+                        str(gpt), graph, product, output, self._args(),
+                        "pre-event", cache_root, False,
+                    )
+
+            self.assertEqual(run_log.read_text(encoding="utf-8"), "SNAP failed\n")
+            self.assertEqual(list(cache_root.rglob(".partial-*")), [])
+
+    def test_disabled_cache_uses_run_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            work_parent = Path(directory) / "work"
+            work_parent.mkdir()
+            args = self._args(no_snap_cache=True, work_dir=str(work_parent))
+            self.assertIsNone(resolve_snap_cache_root(args, work_parent))
+            output = work_parent / "run" / "pre_sigma0_vv.tif"
+
+            result = get_or_create_sigma0(
+                str(gpt), graph, product, output, args, "pre-event",
+                None, False, self._write_sigma0,
+            )
+            self.assertEqual(result, output)
+            validate_sigma0_raster(result)
+
+    def test_cache_keys_are_independent_per_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            other = self._product(
+                directory,
+                identifier="S1A_TEST_GRD_20240414T000000.SAFE",
+            )
+            first, _ = build_snap_cache_key(product, graph, str(gpt), self._args())
+            second, _ = build_snap_cache_key(other, graph, str(gpt), self._args())
+            self.assertNotEqual(first, second)
+
+    def test_sigma0_validation_rejects_nonpositive_raster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raster = Path(directory) / "zero.tif"
+            self._write_sigma0(raster, value=0.0)
+            with self.assertRaisesRegex(InferenceError, "no finite positive"):
+                validate_sigma0_raster(raster)
 
 
 class RasterAlignmentTest(unittest.TestCase):
