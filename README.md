@@ -104,7 +104,7 @@
 
 ### Reproducible environment with uv
 
-The checked-in uv environment targets Linux, Python 3.10, and NVIDIA CUDA 12.4. PyTorch wheels are resolved from the Aliyun mirror; all other packages use the TUNA PyPI mirror.
+The checked-in uv environment targets Linux x86_64, Python 3.10, and NVIDIA CUDA 12.4. PyTorch CUDA wheels are resolved from the official PyTorch wheel repository; all other packages use the TUNA PyPI mirror.
 
 ```shell
 uv sync --locked
@@ -117,6 +117,8 @@ uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available
 ```
 
 The repository does not include the optional `PRETRAINED/` backbone weights. When they are absent, the model starts with random initialization.
+
+Whole-scene inference from downloaded Sentinel-1 GRD `.SAFE` products also requires the ESA SNAP command-line Graph Processing Tool (`gpt`). Install SNAP separately, add `gpt` to `PATH`, set `SNAP_GPT`, or pass `--gpt /path/to/gpt`. The Python environment uses Rasterio for windowed GeoTIFF access and final grid alignment; Python-SNAPPY is not required by `infer_safe.py`.
 
 
 ## Our model
@@ -223,6 +225,40 @@ You can download our novel public S1GFloods dataset through the following link:
     --dataset-dir /path/to/S1GFloods_prepared \
     --path .tmp/S1GFloods_vitae_rsp/checkpoint_epoch_<N>.pth
   ```
+
+- Whole-scene inference from Sentinel-1 GRD SAFE products
+
+  Pass an earlier pre-event product followed by a later post-event product. Both products must contain VV polarization and use the same IW acquisition geometry, orbit direction, and relative orbit. The script applies SNAP orbit correction, GRD border-noise removal, thermal-noise removal, Sigma0 calibration, and terrain correction before sliding-window inference.
+
+  Products ending in `_COG.SAFE` contain ZSTD-compressed Cloud Optimized GeoTIFF measurements. The script will attempt to read them through the installed SNAP version, but support remains SNAP/GDAL-version dependent. If SNAP reports an unsupported compression or reader error, convert the downloaded COG_SAFE ZIP to original GRD SAFE with the official [CDSE utilities](https://github.com/eu-cdse/utilities) (`COG2GRD.sh` requires GDAL 3.6+, `jacksum`, and `xmlstarlet`), or obtain the original SAFE product. The inference error retains the SNAP log and reports this recovery path.
+
+  ```shell
+  uv run python infer_safe.py \
+    /path/to/pre_event.SAFE \
+    /path/to/post_event.SAFE \
+    --checkpoint /path/to/checkpoint.pth \
+    --output /path/to/flood_map.tif \
+    --trust-checkpoint
+  ```
+
+  Example for the Kulsary orbit-159 acquisitions:
+
+  ```shell
+  uv run python infer_safe.py \
+    /volume1/zzn/kazakhstan_flood_2024_sar_urgent/products_kulsary_orbit159/S1A_IW_GRDH_1SDV_20240402T141444_20240402T141510_053256_06745E_D77F_COG.SAFE \
+    /volume1/zzn/kazakhstan_flood_2024_sar_urgent/products_kulsary_orbit159/S1A_IW_GRDH_1SDV_20240414T141444_20240414T141509_053431_067B51_2A05_COG.SAFE \
+    --checkpoint /path/to/current_checkpoint.pth \
+    --output /path/to/kulsary_flood_20240414.tif \
+    --stride 128 \
+    --batch-size 4 \
+    --trust-checkpoint
+  ```
+
+  The primary output is a georeferenced `uint8` mask (`0` background, `255` flood). A `float32` flood-probability GeoTIFF is written beside it as `<output>_probability.tif`. Overlapping `256×256` predictions are blended before thresholding, and `tqdm` reports SNAP, inference, and output progress.
+
+  The model was trained on VV-like 8-bit grayscale images replicated into three channels, but the paper does not document the exact raw-SAR intensity conversion. Deployment therefore maps calibrated linear Sigma0 through a configurable fixed dB range, `[-25, 0] dB` by default. Adjust `--db-min` and `--db-max` only when a validated preprocessing recipe is available. Inputs are not divided by 255 or ImageNet-normalized.
+
+  Current checkpoints must include the registered TACE Q/K/V projections introduced in commit `11c309a`. Older full-model checkpoints cannot be repaired faithfully and are rejected with an explicit error. Because checkpoints are loaded as complete Python objects, use `--trust-checkpoint` only for files from a trusted source.
   
 ## Results
 
