@@ -228,9 +228,29 @@ You can download our novel public S1GFloods dataset through the following link:
 
 - Whole-scene inference from Sentinel-1 GRD SAFE products
 
-  Pass an earlier pre-event product followed by a later post-event product. Both products must contain VV polarization and use the same IW acquisition geometry, orbit direction, and relative orbit. The script applies SNAP orbit correction, GRD border-noise removal, thermal-noise removal, Sigma0 calibration, and terrain correction before sliding-window inference.
+  Pass an earlier pre-event product followed by a later post-event product. Both products must contain VV polarization and use the same IW acquisition geometry, orbit direction, and relative orbit. The inference entry point applies SNAP orbit correction, GRD border-noise removal, thermal-noise removal, Sigma0 calibration, and terrain correction before sliding-window inference.
 
-  Products ending in `_COG.SAFE` contain ZSTD-compressed Cloud Optimized GeoTIFF measurements. The script will attempt to read them through the installed SNAP version, but support remains SNAP/GDAL-version dependent. If SNAP reports an unsupported compression or reader error, convert the downloaded COG_SAFE ZIP to original GRD SAFE with the official [CDSE utilities](https://github.com/eu-cdse/utilities) (`COG2GRD.sh` requires GDAL 3.6+, `jacksum`, and `xmlstarlet`), or obtain the original SAFE product. The inference error retains the SNAP log and reports this recovery path.
+  Products ending in `_COG.SAFE` contain ZSTD-compressed Cloud Optimized GeoTIFF measurements. Direct SNAP support remains SNAP/GDAL-version dependent. If SNAP fails while reading COG metadata, including `noiseVectorListElem is null` in `Remove-GRD-Border-Noise`, restore the products to standard GRD SAFE before prediction.
+
+  Build the official CDSE utilities image once:
+
+  ```shell
+  docker build "https://github.com/eu-cdse/utilities.git#main" -t cdse_utilities
+  ```
+
+  The host must provide `docker`, `zip`, and `unzip`, and the Docker daemon must be accessible to the invoking user. Conversion temporarily needs space for the staged COG ZIP, restored GRD ZIP, and extracted SAFE; the launcher enforces the configurable `MIN_FREE_GIB` threshold before starting.
+
+  Edit the paths and three product names at the top of `restore_cog_safe_to_grd.sh`, then run:
+
+  ```shell
+  bash restore_cog_safe_to_grd.sh
+  ```
+
+  This restoration launcher does not run SNAP or model inference. It creates store-only `_COG.zip` staging archives, runs the official `COG2GRD.sh` inside Docker, validates the regenerated standard SAFE products, and caches them under `restored_grd/`. The original COG SAFE directories are never mounted into Docker or modified. Completed products are reused on later runs.
+
+  The regenerated SAFE names contain newly calculated CRC values and therefore cannot be predicted in advance. The launcher prints the actual COG-to-GRD mappings and creates a common `restored_grd/products/` directory containing links to the validated products. Copy the printed `DATA_ROOT`, `PRE_SAFE_NAME`, and `POST_SAFE_NAME` values into `predict_safe_pair.sh`.
+
+  For already restored or original standard GRD SAFE products, inference can also be invoked directly:
 
   ```shell
   uv run python infer_safe.py \
@@ -241,26 +261,13 @@ You can download our novel public S1GFloods dataset through the following link:
     --trust-checkpoint
   ```
 
-  Example for the Kulsary orbit-159 acquisitions:
-
-  ```shell
-  uv run python infer_safe.py \
-    /volume1/zzn/kazakhstan_flood_2024_sar_urgent/products_kulsary_orbit159/S1A_IW_GRDH_1SDV_20240402T141444_20240402T141510_053256_06745E_D77F_COG.SAFE \
-    /volume1/zzn/kazakhstan_flood_2024_sar_urgent/products_kulsary_orbit159/S1A_IW_GRDH_1SDV_20240414T141444_20240414T141509_053431_067B51_2A05_COG.SAFE \
-    --checkpoint /path/to/current_checkpoint.pth \
-    --output /path/to/kulsary_flood_20240414.tif \
-    --stride 128 \
-    --batch-size 4 \
-    --trust-checkpoint
-  ```
-
   For repeatable GPU-server runs, edit the configuration block at the top of `predict_safe_pair.sh`, then execute:
 
   ```shell
   bash predict_safe_pair.sh
   ```
 
-  The launcher validates all paths, optionally synchronizes the locked uv environment, prints the effective configuration, and saves console output beside the prediction as a `.log` file.
+  The prediction launcher validates all paths, optionally synchronizes the locked uv environment, prints the effective configuration, and saves console output beside the prediction as a `.log` file.
 
   The primary output is a georeferenced `uint8` mask (`0` background, `255` flood). A `float32` flood-probability GeoTIFF is written beside it as `<output>_probability.tif`. Overlapping `256×256` predictions are blended before thresholding, and `tqdm` reports SNAP, inference, and output progress.
 
