@@ -202,6 +202,8 @@ uv run python prepare_etci_pairs.py \
 
 `--download` fetches the pinned Hugging Face revision into the cache; pass `--source /path/to/etci_repo` instead to convert an already-downloaded copy. Use `--dry-run` to inspect the planned pair counts and skip reasons before creating output.
 
+If `huggingface.co` is unreachable or slow, route the download through a mirror with `--hf-endpoint https://hf-mirror.com` (also honored from the `HF_ENDPOINT` environment variable). The endpoint is passed explicitly to `snapshot_download`, so it does not depend on the variable being exported into the process.
+
 Pairing and split policy:
 
 - `--pair-policy nearest-flood-free` (default): for each later tile, pair it with the most recent earlier tile whose own flood label is clean (`0` flood pixels); `adjacent-any` pairs with the immediately preceding tile regardless of its label.

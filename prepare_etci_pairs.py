@@ -69,6 +69,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument(
+        "--hf-endpoint",
+        default=None,
+        help=(
+            "Hugging Face endpoint override (e.g. https://hf-mirror.com). "
+            "Falls back to the HF_ENDPOINT environment variable. Passed "
+            "explicitly to snapshot_download so it does not depend on the "
+            "variable being exported into the process."
+        ),
+    )
+    parser.add_argument(
         "--pair-policy",
         choices=("nearest-flood-free", "adjacent-any"),
         default="nearest-flood-free",
@@ -115,12 +125,19 @@ def resolve_data_root(args: argparse.Namespace) -> Path:
     if args.download:
         from huggingface_hub import snapshot_download
 
+        # Resolve the endpoint explicitly and pass it through to snapshot_download
+        # so routing does not depend on HF_ENDPOINT reaching this process.
+        endpoint = args.hf_endpoint or os.environ.get("HF_ENDPOINT")
+        if endpoint:
+            os.environ["HF_ENDPOINT"] = endpoint
+            print(f"HF endpoint: {endpoint}")
         snapshot_path = snapshot_download(
             repo_id=args.repo_id,
             repo_type="dataset",
             revision=args.revision,
             cache_dir=str(args.cache_dir) if args.cache_dir else None,
             allow_patterns=["README.md", "data/train/**", "data/test/**"],
+            endpoint=endpoint,
         )
         return find_data_root(Path(snapshot_path))
     return find_data_root(args.source)
