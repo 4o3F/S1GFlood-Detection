@@ -654,8 +654,8 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.3,<1.6" },
     { name = "tensorboardx", specifier = ">=2.6,<3" },
     { name = "timm", specifier = "==0.6.13" },
-    { name = "torch", specifier = "==2.5.1+cu124", index = "https://download.pytorch.org/whl/cu124" },
-    { name = "torchvision", specifier = "==0.20.1+cu124", index = "https://download.pytorch.org/whl/cu124" },
+    { name = "torch", specifier = "==2.5.1+cu124", index = "https://mirrors.nju.edu.cn/pytorch/whl/cu124" },
+    { name = "torchvision", specifier = "==0.20.1+cu124", index = "https://mirrors.nju.edu.cn/pytorch/whl/cu124" },
     { name = "tqdm", specifier = ">=4.66,<5" },
 ]
 
@@ -767,7 +767,7 @@ wheels = [
 [[package]]
 name = "torch"
 version = "2.5.1+cu124"
-source = { registry = "https://download.pytorch.org/whl/cu124" }
+source = { registry = "https://mirrors.nju.edu.cn/pytorch/whl/cu124" }
 dependencies = [
     { name = "filelock", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "fsspec", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -790,20 +790,20 @@ dependencies = [
     { name = "typing-extensions", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu124/torch-2.5.1%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:9dde30f399ca22137455cca4d47140dfb7f4176e2d16a9729fc044eebfadb13a", upload-time = "2024-10-29T23:29:41Z" },
+    { url = "https://mirrors.nju.edu.cn/pytorch/whl/cu124/torch-2.5.1%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:9dde30f399ca22137455cca4d47140dfb7f4176e2d16a9729fc044eebfadb13a", upload-time = "2024-10-29T23:29:41Z" },
 ]
 
 [[package]]
 name = "torchvision"
 version = "0.20.1+cu124"
-source = { registry = "https://download.pytorch.org/whl/cu124" }
+source = { registry = "https://mirrors.nju.edu.cn/pytorch/whl/cu124" }
 dependencies = [
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pillow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu124/torchvision-0.20.1%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:3a055e4e9040b129878d57c39db55f117f975899ff30dd70c8f2621d91170dbe", upload-time = "2024-10-29T23:47:12Z" },
+    { url = "https://mirrors.nju.edu.cn/pytorch/whl/cu124/torchvision-0.20.1%2Bcu124-cp310-cp310-linux_x86_64.whl", hash = "sha256:3a055e4e9040b129878d57c39db55f117f975899ff30dd70c8f2621d91170dbe", upload-time = "2024-10-29T23:47:12Z" },
 ]
 
 [[package]]
