@@ -182,6 +182,39 @@ The default deterministic split uses seed `42` and creates `4,300` training, `53
 
 For large datasets, `--mode hardlink` avoids duplicating file data when source and output are on the same filesystem. `--mode symlink` is also available.
 
+### ETCI-2021 temporal pairs
+
+The [ETCI-2021 Flood Detection](https://huggingface.co/datasets/blanchon/ETCI-2021-Flood-Detection) dataset ships per-date Sentinel-1 VV/VH tiles plus RGB flood masks. Several regions are captured on multiple dates, so a single offline converter, `prepare_etci_pairs.py`, reorganizes them into the same bi-temporal `train/val/test` `{A, B, GT}` layout as S1GFloods:
+
+- **A** = earlier-date VV tile for a `(region, x, y)` coordinate
+- **B** = later-date VV tile for the same coordinate
+- **GT** = later-date `flood_label`, rewritten to single-channel mode-L `{0, 255}` (always re-encoded, never hardlinked from the RGB source)
+
+```shell
+uv run python prepare_etci_pairs.py \
+  --download \
+  --output /path/to/ETCI_2021_prepared \
+  --pair-policy nearest-flood-free \
+  --val-ratio 0.1 \
+  --seed 42 \
+  --mode hardlink
+```
+
+`--download` fetches the pinned Hugging Face revision into the cache; pass `--source /path/to/etci_repo` instead to convert an already-downloaded copy. Use `--dry-run` to inspect the planned pair counts and skip reasons before creating output.
+
+Pairing and split policy:
+
+- `--pair-policy nearest-flood-free` (default): for each later tile, pair it with the most recent earlier tile whose own flood label is clean (`0` flood pixels); `adjacent-any` pairs with the immediately preceding tile regardless of its label.
+- Train pairs are group-split into `train`/`val` by `(region, x, y)` using a seeded SHA-256 hash, so all dates of one tile coordinate stay in the same split (leakage-free).
+- Source `test` pairs (Florence) are written to output `test`; source `test_internal` tiles carry no `flood_label` and are excluded.
+- Lightweight QC drops tiles that are too small (`--min-vv-bytes`), uniform, or saturated (`--max-saturated-fraction`); use `--no-keep-negative-post` to drop tiles whose post-event label has no flood.
+
+Caveat: tile alignment is inferred from matching `(region, x, y)` keys and equal image shapes. The PNG mirror carries no Sentinel-1 product, orbit, or geotransform metadata, so coordinate equality does not prove strict geographic registration. The output is a drop-in root for `train.py`/`eval.py`:
+
+```shell
+uv run python train.py --dataset-dir /path/to/ETCI_2021_prepared
+```
+
               
 ## :truck: Datasets <a name="dataset"></a>
 

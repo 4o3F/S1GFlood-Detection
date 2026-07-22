@@ -630,6 +630,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "einops", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "huggingface-hub", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "mmcv-lite", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pillow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -645,6 +646,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "einops", specifier = "==0.8.1" },
+    { name = "huggingface-hub", specifier = "==1.23.0" },
     { name = "mmcv-lite", specifier = "==2.2.0" },
     { name = "numpy", specifier = ">=1.24,<2" },
     { name = "pillow", specifier = ">=9.5,<10" },
