@@ -217,6 +217,24 @@ Caveat: tile alignment is inferred from matching `(region, x, y)` keys and equal
 uv run python train.py --dataset-dir /path/to/ETCI_2021_prepared
 ```
 
+### Joint training on multiple datasets
+
+`train.py` trains on a single prepared root. To mix several datasets (e.g. S1GFloods and the ETCI-2021 temporal pairs above), merge their prepared roots into one with `merge_datasets.py`, then point training at the merged root. The training loader shuffles, so samples from every source are interleaved each epoch.
+
+```shell
+uv run python merge_datasets.py \
+  --input /path/to/S1GFloods_prepared \
+  --input /path/to/ETCI_2021_prepared \
+  --output /path/to/merged \
+  --mode hardlink
+```
+
+Each `--input` must be a prepared root with `{train,val,test}/{A,B,GT}`. `--mode hardlink` combines sources without duplicating file data (falls back to copy across filesystems). Cross-source filename collisions are rejected by default; ETCI pairs are prefixed `etci_`, so S1GFloods and ETCI never collide. Use `--on-collision rename` (with `--tag NAME` per input) to re-namespace when sources share names, and `--dry-run` to preview counts first. The merged root is a drop-in `--dataset-dir`:
+
+```shell
+uv run python train.py --dataset-dir /path/to/merged
+```
+
               
 ## :truck: Datasets <a name="dataset"></a>
 
