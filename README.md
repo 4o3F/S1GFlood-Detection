@@ -217,6 +217,76 @@ Caveat: tile alignment is inferred from matching `(region, x, y)` keys and equal
 uv run python train.py --dataset-dir /path/to/ETCI_2021_prepared
 ```
 
+### Kulsary Orbit 159 temporal pairs
+
+`prepare_kulsary_pairs.py` converts the three Kulsary 2024 Sentinel-1
+acquisitions and their PNG+PGW water masks into the same
+`{train,val,test}/{A,B,GT}` contract. It creates two semantic variants at each
+valid tile coordinate:
+
+| Variant | A (baseline) | B (flood peak) | GT | Chronology |
+|---|---|---|---|---|
+| `before_to_peak` | 2024-04-02 | 2024-04-14 | peak water excluding 04-02 water | chronological |
+| `after_to_peak` | 2024-04-26 | 2024-04-14 | peak water excluding 04-26 water | deliberately reversed |
+
+The converter requires three restored, standard GRD SAFE products under
+`--safe-root` or its managed `products/` directory. Products are assigned to
+roles from acquisition dates in their `manifest.safe`, so the restored filename
+CRC is irrelevant. COG SAFE products are rejected; restoration remains a
+separate workflow.
+
+Upload the three mask PNGs and sibling PGW files to the server, then run the
+static validation first:
+
+```shell
+uv run python prepare_kulsary_pairs.py \
+  --source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
+  --safe-root /home/ubuntu/lhx/Sentinel1-SAR/restored_grd \
+  --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_prepared \
+  --dry-run
+```
+
+The dry run validates mask geometry and SAFE metadata, prints source-grid GT
+pixel counts and both pair definitions, and probes the existing SNAP cache. It
+does not require `gpt` and does not create output, work, staging, or cache
+directories.
+
+Run the full conversion on the GPU server with the same SNAP parameters used
+by `predict_safe_pair.sh`:
+
+```shell
+uv run python prepare_kulsary_pairs.py \
+  --source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
+  --safe-root /home/ubuntu/lhx/Sentinel1-SAR/restored_grd \
+  --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_prepared \
+  --work-dir "${HOME}/scratch/damnet-safe" \
+  --snap-cache-dir "${HOME}/scratch/damnet-safe/snap-cache" \
+  --gpt /usr/local/esa-snap/bin/gpt \
+  --target-crs EPSG:32639 \
+  --pixel-spacing 10
+```
+
+The peak-date Sigma0 raster defines the common grid. Before/after Sigma0 is
+warped bilinearly, masks are warped nearest-neighbor from their WGS84 PGW
+geometry, and linear Sigma0 is mapped through `[-25,0] dB` before being saved
+as RGB PNG. Tiles are non-overlapping 256×256 windows. Incomplete edges and
+windows containing an invalid pixel in any acquisition are dropped for both
+variants, while all-background GT tiles are retained.
+
+Unique 2×2-tile spatial super-blocks are deterministically assigned
+80/10/10 to train, validation, and test. Both variants at one coordinate
+always share a split. The output includes split, pair, QC, and skipped-record
+manifests and can be passed directly to `train.py` or merged with another
+prepared root:
+
+```shell
+uv run python merge_datasets.py \
+  --input /path/to/S1GFloods_prepared \
+  --input /home/ubuntu/lhx/Sentinel1-SAR/kulsary_prepared \
+  --output /path/to/merged \
+  --mode hardlink
+```
+
 ### Joint training on multiple datasets
 
 `train.py` trains on a single prepared root. To mix several datasets (e.g. S1GFloods and the ETCI-2021 temporal pairs above), merge their prepared roots into one with `merge_datasets.py`, then point training at the merged root. The training loader shuffles, so samples from every source are interleaved each epoch.
