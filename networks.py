@@ -489,6 +489,32 @@ class TemporalDifferentialFusion(nn.Module):
         return M
 
 
+class WaterSegmentationHead(nn.Module):
+    def __init__(self, in_channels=32, hidden_channels=16, output_nc=2):
+        super().__init__()
+        self.refine = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(4, hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, output_nc, kernel_size=1),
+        )
+
+    def forward(self, feature_map, output_size):
+        logits = self.refine(feature_map)
+        return F.interpolate(
+            logits,
+            size=output_size,
+            mode='bilinear',
+            align_corners=False,
+        )
+
+
 class DAMNet_New(Backbone):
     def __init__(self, args, input_nc, output_nc, with_pos, resnet_stages_num=5, token_len=4, token_trans=True, enc_depth=1, dec_depth=1,
                  dim_head=64, decoder_dim_head=64, tokenizer=True, if_upsample_2x=True, pool_mode='max', pool_size=2, backbone='vitae',
@@ -528,6 +554,11 @@ class DAMNet_New(Backbone):
         self.TACE_pre = TemporalAwareChangeEnhancement(token_dim=dim, H=H_map, W=W_map, is_last_stage=True)
         self.TACE_post = TemporalAwareChangeEnhancement(token_dim=dim, H=H_map, W=W_map, is_last_stage=True)
         self.TDF = TemporalDifferentialFusion(token_dim=dim, output_nc=output_nc)
+        self.water_head = WaterSegmentationHead(
+            in_channels=dim,
+            hidden_channels=dim // 2,
+            output_nc=2,
+        )
 
     def _forward_semantic_tokens(self, x):
         b, c, h, w = x.shape
@@ -567,9 +598,20 @@ class DAMNet_New(Backbone):
         return x_map, x_token
 
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, return_aux=False):
+        output_size_a = x1.shape[-2:]
+        output_size_b = x2.shape[-2:]
         x1_map = self.forward_single(x1)
-        x2_map = self.forward_single(x2) 
+        x2_map = self.forward_single(x2)
+
+        if return_aux:
+            if not hasattr(self, 'water_head'):
+                raise RuntimeError(
+                    'This checkpoint does not contain the auxiliary water head. '
+                    'Use default change inference or train a new checkpoint.'
+                )
+            water_a_logits = self.water_head(x1_map, output_size_a)
+            water_b_logits = self.water_head(x2_map, output_size_b)
 
         if self.tokenizer:
             token1 = self._forward_semantic_tokens(x1_map)
@@ -598,4 +640,10 @@ class DAMNet_New(Backbone):
         if self.output_sigmoid:
             x = self.sigmoid(x)
 
-        return x
+        if not return_aux:
+            return x
+        return {
+            'change_logits': x,
+            'water_a_logits': water_a_logits,
+            'water_b_logits': water_b_logits,
+        }

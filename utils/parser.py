@@ -1,8 +1,10 @@
 import argparse as ag
 import json
+import math
 
 
 MAX_EPOCHS = 1000
+DEFAULT_WATER_LOSS_WEIGHT = 0.2
 
 
 def positive_int(value):
@@ -28,8 +30,8 @@ def epoch_count(value):
 
 def nonnegative_float(value):
     parsed = float(value)
-    if parsed < 0:
-        raise ag.ArgumentTypeError('value must be non-negative')
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ag.ArgumentTypeError('value must be finite and non-negative')
     return parsed
 
 
@@ -60,5 +62,14 @@ def parser_with_args(metadata_json='metadata_file.json'):
     parser.add_argument('--min-f1-improvement', default=metadata['min_f1_improvement'],
                         type=nonnegative_float,
                         help='minimum absolute F1 increase required to reset patience')
+    parser.add_argument(
+        '--water-loss-weight',
+        default=metadata.get(
+            'water_loss_weight',
+            DEFAULT_WATER_LOSS_WEIGHT,
+        ),
+        type=nonnegative_float,
+        help='weight of paired complete-water auxiliary supervision',
+    )
 
     return parser, metadata

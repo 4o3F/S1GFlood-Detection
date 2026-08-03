@@ -77,37 +77,170 @@ def binary_metrics_from_confusion(confusion):
     }
 
 
-def validate(model, val_loader, criterion, device, learning_rate):
-    confusion = np.zeros((2, 2), dtype=np.int64)
-    total_loss = 0.0
+def binary_iou_from_confusion(confusion):
+    _, fp, fn, tp = confusion.ravel()
+    return safe_divide(tp, tp + fp + fn)
+
+
+def move_targets_to_device(targets, device):
+    return {
+        name: value.to(device)
+        for name, value in targets.items()
+    }
+
+
+def _change_logits(outputs):
+    return outputs['change_logits'] if isinstance(outputs, dict) else outputs
+
+
+def compute_multitask_loss(
+    outputs,
+    targets,
+    criterion,
+    water_loss_weight,
+):
+    change_loss = criterion(
+        _change_logits(outputs),
+        targets['change'].long(),
+    )
+    valid = targets['water_valid'].bool()
+    supervised_count = (
+        int(valid.sum().item())
+        if water_loss_weight > 0
+        else 0
+    )
+
+    if supervised_count:
+        if not isinstance(outputs, dict):
+            raise ValueError('auxiliary logits are required for water-supervised samples')
+        water_logits = torch.cat(
+            (
+                outputs['water_a_logits'][valid],
+                outputs['water_b_logits'][valid],
+            ),
+            dim=0,
+        )
+        water_targets = torch.cat(
+            (
+                targets['water_a'][valid].long(),
+                targets['water_b'][valid].long(),
+            ),
+            dim=0,
+        )
+        water_loss = criterion(water_logits, water_targets)
+    else:
+        water_loss = change_loss.new_zeros(())
+
+    return {
+        'total': change_loss + water_loss_weight * water_loss,
+        'change': change_loss,
+        'water': water_loss,
+        'water_supervised_samples': supervised_count,
+    }
+
+
+def _add_confusion(confusion, targets, predictions):
+    confusion += confusion_matrix(
+        targets.detach().cpu().numpy().ravel(),
+        predictions.detach().cpu().numpy().ravel(),
+        labels=[0, 1],
+    )
+
+
+def _add_water_metrics(metrics, prefix, confusion):
+    binary = binary_metrics_from_confusion(confusion)
+    metrics[f'{prefix}_precision'] = binary['precisions']
+    metrics[f'{prefix}_recall'] = binary['recalls']
+    metrics[f'{prefix}_f1'] = binary['f1_scores']
+    metrics[f'{prefix}_iou'] = binary_iou_from_confusion(confusion)
+
+
+def validate(
+    model,
+    val_loader,
+    criterion,
+    device,
+    learning_rate,
+    water_loss_weight=0.2,
+):
+    change_confusion = np.zeros((2, 2), dtype=np.int64)
+    water_a_confusion = np.zeros((2, 2), dtype=np.int64)
+    water_b_confusion = np.zeros((2, 2), dtype=np.int64)
+    change_loss_sum = 0.0
+    water_loss_sum = 0.0
+    water_supervised_samples = 0
     total_samples = 0
 
     model.eval()
     with torch.no_grad():
-        for img1, img2, labels, _ in val_loader:
+        for img1, img2, targets, _ in val_loader:
             img1 = img1.float().to(device)
             img2 = img2.float().to(device)
-            labels = labels.long().to(device)
-
-            outputs = model(img1, img2)
-            loss = criterion(outputs, labels)
-            predictions = torch.argmax(outputs, dim=1)
-            batch_size = labels.size(0)
-
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
-            confusion += confusion_matrix(
-                labels.cpu().numpy().ravel(),
-                predictions.cpu().numpy().ravel(),
-                labels=[0, 1],
+            targets = move_targets_to_device(targets, device)
+            valid = targets['water_valid'].bool()
+            request_aux = water_loss_weight > 0 and bool(valid.any())
+            outputs = model(img1, img2, return_aux=True) if request_aux else model(img1, img2)
+            losses = compute_multitask_loss(
+                outputs,
+                targets,
+                criterion,
+                water_loss_weight,
             )
+
+            change_logits = _change_logits(outputs)
+            change_predictions = torch.argmax(change_logits, dim=1)
+            batch_size = targets['change'].size(0)
+            change_loss_sum += losses['change'].item() * batch_size
+            total_samples += batch_size
+            _add_confusion(
+                change_confusion,
+                targets['change'],
+                change_predictions,
+            )
+
+            valid_count = losses['water_supervised_samples']
+            if valid_count:
+                water_supervised_samples += valid_count
+                water_loss_sum += losses['water'].item() * valid_count
+                _add_confusion(
+                    water_a_confusion,
+                    targets['water_a'][valid],
+                    torch.argmax(outputs['water_a_logits'][valid], dim=1),
+                )
+                _add_confusion(
+                    water_b_confusion,
+                    targets['water_b'][valid],
+                    torch.argmax(outputs['water_b_logits'][valid], dim=1),
+                )
 
     if total_samples == 0:
         raise ValueError('validation loader is empty')
 
-    metrics = binary_metrics_from_confusion(confusion)
-    metrics['losses'] = total_loss / total_samples
+    change_loss = change_loss_sum / total_samples
+    water_loss = (
+        water_loss_sum / water_supervised_samples
+        if water_supervised_samples
+        else 0.0
+    )
+    metrics = binary_metrics_from_confusion(change_confusion)
+    metrics['change_losses'] = change_loss
+    metrics['water_losses'] = water_loss
+    metrics['weighted_water_losses'] = water_loss_weight * water_loss
+    metrics['losses'] = change_loss + water_loss_weight * water_loss
     metrics['learning_rate'] = learning_rate
+    metrics['water_supervised_samples'] = water_supervised_samples
+    metrics['water_supervision_fraction'] = (
+        water_supervised_samples / total_samples
+    )
+
+    if water_supervised_samples:
+        _add_water_metrics(metrics, 'water_a', water_a_confusion)
+        _add_water_metrics(metrics, 'water_b', water_b_confusion)
+        _add_water_metrics(
+            metrics,
+            'water_pooled',
+            water_a_confusion + water_b_confusion,
+        )
     return metrics
 
 
@@ -119,7 +252,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, opt,
     batch_iter = 0
 
     tbar = tqdm(train_loader)
-    for img1, img2, labels, _ in tbar:
+    for img1, img2, targets, _ in tbar:
         tbar.set_description(
             f'epoch {epoch_number} info {batch_iter} - {batch_iter + opt.batch_size}'
         )
@@ -128,19 +261,24 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, opt,
 
         img1 = img1.float().to(device)
         img2 = img2.float().to(device)
-        labels = labels.long().to(device)
+        targets = move_targets_to_device(targets, device)
+        valid = targets['water_valid'].bool()
+        request_aux = opt.water_loss_weight > 0 and bool(valid.any())
 
         optimizer.zero_grad()
-        outputs = model(img1, img2)
-        loss = criterion(outputs, labels)
-        loss.backward()
+        outputs = model(img1, img2, return_aux=True) if request_aux else model(img1, img2)
+        losses = compute_multitask_loss(
+            outputs,
+            targets,
+            criterion,
+            opt.water_loss_weight,
+        )
+        losses['total'].backward()
         optimizer.step()
 
-        predictions = torch.argmax(outputs, dim=1)
-        overall_accuracy = (
-            (predictions.squeeze().byte() == labels.squeeze().byte()).sum()
-            / (labels.size(0) * (opt.patch_size ** 2))
-        )
+        labels = targets['change'].long()
+        predictions = torch.argmax(_change_logits(outputs), dim=1)
+        overall_accuracy = (predictions == labels).float().mean()
         train_report = precision_recall_fscore_support(
             labels.detach().cpu().numpy().ravel(),
             predictions.detach().cpu().numpy().ravel(),
@@ -150,10 +288,15 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, opt,
         )
         train_metrics = set_metrics(
             train_metrics,
-            loss,
+            losses['total'],
             overall_accuracy,
             train_report,
             scheduler.get_last_lr(),
+            change_loss=losses['change'],
+            water_loss=losses['water'],
+            water_loss_weight=opt.water_loss_weight,
+            water_supervised_samples=losses['water_supervised_samples'],
+            batch_size=labels.size(0),
         )
         mean_train_metrics = get_mean_metrics(train_metrics)
         for name, value in mean_train_metrics.items():
@@ -257,6 +400,7 @@ def main():
                 criterion,
                 device,
                 scheduler.get_last_lr()[0],
+                opt.water_loss_weight,
             )
             logging.info(f'EPOCH {epoch_number} VALIDATION METRICS: {val_metrics}')
             for name, value in val_metrics.items():

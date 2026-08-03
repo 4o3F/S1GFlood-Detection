@@ -1,9 +1,44 @@
-import torch
 import random
-import numpy as np
 
-from PIL import Image, ImageOps, ImageFilter
+import numpy as np
+import torch
+from PIL import Image, ImageFilter, ImageOps
 import torchvision.transforms as transforms
+
+
+_ALLOWED_MASK_VALUES = {0, 1, 255}
+
+
+def _temporal_targets(sample):
+    if 'targets' in sample:
+        return sample['targets'], False
+    return {'change': sample['label']}, True
+
+
+def _temporal_sample(sample, images, targets, legacy):
+    result = dict(sample)
+    result['image'] = images
+    if legacy:
+        result.pop('targets', None)
+        result['label'] = targets['change']
+    else:
+        result.pop('label', None)
+        result['targets'] = targets
+    return result
+
+
+def _transform_targets(targets, operation):
+    return {name: operation(mask) for name, mask in targets.items()}
+
+
+def _mask_to_tensor(mask):
+    array = np.asarray(mask)
+    values = set(np.unique(array).tolist())
+    if not values.issubset(_ALLOWED_MASK_VALUES):
+        raise ValueError(
+            f'mask must contain only {{0,1,255}}, found {sorted(values)}'
+        )
+    return torch.from_numpy(np.asarray(array > 0, dtype=np.float32)).float()
 
 
 class FixedResize(object):
@@ -11,18 +46,21 @@ class FixedResize(object):
         self.size = (size, size)
 
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
+        if any(img1.size != mask.size or img2.size != mask.size for mask in targets.values()):
+            raise ValueError('image and target sizes must match before resize')
 
-        assert img1.size == mask.size and img2.size == mask.size
+        images = (
+            img1.resize(self.size, Image.BILINEAR),
+            img2.resize(self.size, Image.BILINEAR),
+        )
+        targets = _transform_targets(
+            targets,
+            lambda mask: mask.resize(self.size, Image.NEAREST),
+        )
+        return _temporal_sample(sample, images, targets, legacy)
 
-        img1 = img1.resize(self.size, Image.BILINEAR)
-        img2 = img2.resize(self.size, Image.BILINEAR)
-        mask = mask.resize(self.size, Image.NEAREST)
-
-        return {'image': (img1, img2), 'label': mask}
-    
 
 class FixScaleCrop(object):
     def __init__(self, crop_size):
@@ -48,7 +86,7 @@ class FixScaleCrop(object):
         mask = mask.crop((x1, y1, x1 + self.crop_size, y1 + self.crop_size))
 
         return {'image': img, 'label': mask}
-    
+
 
 class Normalize(object):
     def __init__(self, mean=(0., 0., 0.), std=(1., 1., 1.)):
@@ -69,43 +107,49 @@ class Normalize(object):
 
 class ToTensor(object):
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
-        img1 = np.array(img1).astype(np.float32).transpose((2, 0, 1))
-        img2 = np.array(img2).astype(np.float32).transpose((2, 0, 1))
-        mask = np.array(mask).astype(np.float32) / 255.0
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
+        images = (
+            torch.from_numpy(
+                np.asarray(img1, dtype=np.float32).transpose((2, 0, 1))
+            ).float(),
+            torch.from_numpy(
+                np.asarray(img2, dtype=np.float32).transpose((2, 0, 1))
+            ).float(),
+        )
+        tensor_targets = {
+            name: _mask_to_tensor(mask)
+            for name, mask in targets.items()
+        }
+        return _temporal_sample(sample, images, tensor_targets, legacy)
 
-        img1 = torch.from_numpy(img1).float()
-        img2 = torch.from_numpy(img2).float()
-        mask = torch.from_numpy(mask).float()
-
-        return {'image': (img1, img2), 'label': mask}
 
 class RandomVerticalFlip(object):
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
         if random.random() < 0.5:
             img1 = img1.transpose(Image.FLIP_TOP_BOTTOM)
             img2 = img2.transpose(Image.FLIP_TOP_BOTTOM)
-            mask = mask.transpose(Image.FLIP_TOP_BOTTOM)
+            targets = _transform_targets(
+                targets,
+                lambda mask: mask.transpose(Image.FLIP_TOP_BOTTOM),
+            )
+        return _temporal_sample(sample, (img1, img2), targets, legacy)
 
-        return {'image': (img1, img2), 'label': mask}
-    
 
 class RandomHorizontalFlip(object):
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
         if random.random() < 0.5:
             img1 = img1.transpose(Image.FLIP_LEFT_RIGHT)
             img2 = img2.transpose(Image.FLIP_LEFT_RIGHT)
-            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
-
-        return {'image': (img1, img2), 'label': mask}
+            targets = _transform_targets(
+                targets,
+                lambda mask: mask.transpose(Image.FLIP_LEFT_RIGHT),
+            )
+        return _temporal_sample(sample, (img1, img2), targets, legacy)
 
 
 class RandomRotate(object):
@@ -113,32 +157,36 @@ class RandomRotate(object):
         self.degree = degree
 
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
-        rotate_degree = random.uniform(-1*self.degree, self.degree)
-        img1 = img1.rotate(rotate_degree, Image.BILINEAR)
-        img2 = img2.rotate(rotate_degree, Image.BILINEAR)
-        mask = mask.rotate(rotate_degree, Image.NEAREST)
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
+        rotate_degree = random.uniform(-self.degree, self.degree)
+        images = (
+            img1.rotate(rotate_degree, Image.BILINEAR),
+            img2.rotate(rotate_degree, Image.BILINEAR),
+        )
+        targets = _transform_targets(
+            targets,
+            lambda mask: mask.rotate(rotate_degree, Image.NEAREST),
+        )
+        return _temporal_sample(sample, images, targets, legacy)
 
-        return {'image': (img1, img2), 'label': mask}
-    
 
 class RandomFixRotate(object):
     def __init__(self):
         self.degree = [Image.ROTATE_90, Image.ROTATE_180, Image.ROTATE_270]
 
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
         if random.random() < 0.75:
             rotate_degree = random.choice(self.degree)
             img1 = img1.transpose(rotate_degree)
             img2 = img2.transpose(rotate_degree)
-            mask = mask.transpose(rotate_degree)
-
-        return {'image': (img1, img2), 'label': mask}
+            targets = _transform_targets(
+                targets,
+                lambda mask: mask.transpose(rotate_degree),
+            )
+        return _temporal_sample(sample, (img1, img2), targets, legacy)
 
 
 class RandomScaleCrop(object):
@@ -178,22 +226,21 @@ class RandomScaleCrop(object):
 
 class RandomGaussianBlur(object):
     def __call__(self, sample):
-        img1 = sample['image'][0]
-        img2 = sample['image'][1]
-        mask = sample['label']
+        img1, img2 = sample['image']
+        targets, legacy = _temporal_targets(sample)
         if random.random() < 0.5:
-            img1 = img1.filter(ImageFilter.GaussianBlur(
-                radius=random.random()))
-            img2 = img2.filter(ImageFilter.GaussianBlur(
-                radius=random.random()))
+            img1 = img1.filter(ImageFilter.GaussianBlur(radius=random.random()))
+            img2 = img2.filter(ImageFilter.GaussianBlur(radius=random.random()))
+        return _temporal_sample(sample, (img1, img2), targets, legacy)
 
-        return {'image': (img1, img2), 'label': mask}
 
 train_transforms = transforms.Compose([
-            RandomHorizontalFlip(),
-            RandomVerticalFlip(),
-            RandomFixRotate(),
-            ToTensor()])
+    RandomHorizontalFlip(),
+    RandomVerticalFlip(),
+    RandomFixRotate(),
+    ToTensor(),
+])
 
 test_transforms = transforms.Compose([
-            ToTensor()])
+    ToTensor(),
+])

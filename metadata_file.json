@@ -10,6 +10,7 @@
   "validation_interval": 10,
   "early_stopping_patience": 3,
   "min_f1_improvement": 0.001,
+  "water_loss_weight": 0.2,
   "dataset_dir": "./S1GFloods/",
   "weight_dir": "./results/"
 }

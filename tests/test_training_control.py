@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
@@ -6,8 +9,11 @@ import torch.nn as nn
 
 from networks import TemporalAwareChangeEnhancement
 from train import (ADAMW_DEFAULTS, binary_metrics_from_confusion, build_optimizer,
-                   is_significant_improvement, resolve_optimizer_type,
-                   should_stop_early, should_validate)
+                   compute_multitask_loss, is_significant_improvement,
+                   resolve_optimizer_type, should_stop_early, should_validate,
+                   validate)
+from utils.helpers import (dice_loss, get_mean_metrics, initialize_metrics,
+                           set_metrics)
 from utils.parser import parser_with_args
 
 
@@ -88,6 +94,334 @@ class BinaryMetricsTest(unittest.TestCase):
         self.assertEqual(metrics['recalls'], 0.0)
         self.assertEqual(metrics['f1_scores'], 0.0)
         self.assertEqual(metrics['overall_accuracy'], 1.0)
+
+
+class DiceLossTest(unittest.TestCase):
+    def test_reduces_over_both_spatial_dimensions_for_3d_targets(self):
+        logits = torch.tensor([
+            [
+                [[2.0, -1.0, 0.5], [1.5, -0.5, 0.0]],
+                [[-1.0, 2.0, -0.5], [-1.5, 0.5, 1.0]],
+            ],
+        ])
+        targets = torch.tensor([[[0, 1, 0], [0, 1, 1]]])
+
+        probabilities = torch.softmax(logits, dim=1)
+        one_hot = torch.nn.functional.one_hot(
+            targets,
+            num_classes=2,
+        ).permute(0, 3, 1, 2).float()
+        dimensions = (0, 2, 3)
+        intersection = torch.sum(probabilities * one_hot, dimensions)
+        cardinality = torch.sum(probabilities + one_hot, dimensions)
+        expected = 1 - (
+            2 * intersection / (cardinality + 1e-7)
+        ).mean()
+
+        torch.testing.assert_close(dice_loss(logits, targets), expected)
+        torch.testing.assert_close(
+            dice_loss(logits, targets.unsqueeze(1)),
+            expected,
+        )
+
+
+class MultiTaskLossTest(unittest.TestCase):
+    def setUp(self):
+        self.criterion = nn.CrossEntropyLoss()
+        self.change_logits = torch.randn(2, 2, 3, 3, requires_grad=True)
+        self.water_a_logits = torch.randn(2, 2, 3, 3, requires_grad=True)
+        self.water_b_logits = torch.randn(2, 2, 3, 3, requires_grad=True)
+        self.targets = {
+            'change': torch.tensor([
+                [[0, 1, 0], [1, 1, 0], [0, 0, 1]],
+                [[1, 0, 1], [0, 0, 1], [1, 1, 0]],
+            ]),
+            'water_a': torch.tensor([
+                [[0, 1, 0], [1, 1, 0], [0, 0, 1]],
+                [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            ]),
+            'water_b': torch.tensor([
+                [[1, 1, 0], [1, 0, 0], [0, 1, 1]],
+                [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            ]),
+            'water_valid': torch.tensor([True, False]),
+        }
+
+    def _outputs(self):
+        return {
+            'change_logits': self.change_logits,
+            'water_a_logits': self.water_a_logits,
+            'water_b_logits': self.water_b_logits,
+        }
+
+    def test_auxiliary_loss_uses_only_valid_samples(self):
+        losses = compute_multitask_loss(
+            self._outputs(),
+            self.targets,
+            self.criterion,
+            water_loss_weight=0.2,
+        )
+        expected_change = self.criterion(
+            self.change_logits,
+            self.targets['change'],
+        )
+        expected_water = self.criterion(
+            torch.cat((self.water_a_logits[:1], self.water_b_logits[:1])),
+            torch.cat((self.targets['water_a'][:1], self.targets['water_b'][:1])),
+        )
+        torch.testing.assert_close(losses['change'], expected_change)
+        torch.testing.assert_close(losses['water'], expected_water)
+        torch.testing.assert_close(
+            losses['total'],
+            expected_change + 0.2 * expected_water,
+        )
+        self.assertEqual(losses['water_supervised_samples'], 1)
+
+    def test_invalid_placeholder_masks_have_zero_auxiliary_gradient(self):
+        losses = compute_multitask_loss(
+            self._outputs(),
+            self.targets,
+            self.criterion,
+            water_loss_weight=0.2,
+        )
+        losses['total'].backward()
+        self.assertGreater(self.water_a_logits.grad[0].abs().sum().item(), 0)
+        self.assertGreater(self.water_b_logits.grad[0].abs().sum().item(), 0)
+        self.assertEqual(self.water_a_logits.grad[1].abs().sum().item(), 0)
+        self.assertEqual(self.water_b_logits.grad[1].abs().sum().item(), 0)
+
+    def test_unlabeled_batch_accepts_default_tensor_output(self):
+        targets = dict(self.targets)
+        targets['water_valid'] = torch.tensor([False, False])
+        losses = compute_multitask_loss(
+            self.change_logits,
+            targets,
+            self.criterion,
+            water_loss_weight=0.2,
+        )
+        expected = self.criterion(self.change_logits, targets['change'])
+        torch.testing.assert_close(losses['total'], expected)
+        self.assertEqual(losses['water'].item(), 0.0)
+        self.assertEqual(losses['water_supervised_samples'], 0)
+
+    def test_zero_weight_disables_auxiliary_task_even_when_labels_exist(self):
+        losses = compute_multitask_loss(
+            self.change_logits,
+            self.targets,
+            self.criterion,
+            water_loss_weight=0.0,
+        )
+        expected = self.criterion(self.change_logits, self.targets['change'])
+        torch.testing.assert_close(losses['total'], expected)
+        self.assertEqual(losses['water'].item(), 0.0)
+        self.assertEqual(losses['water_supervised_samples'], 0)
+
+    def test_supervised_batch_requires_auxiliary_logits(self):
+        with self.assertRaisesRegex(ValueError, 'auxiliary logits'):
+            compute_multitask_loss(
+                self.change_logits,
+                self.targets,
+                self.criterion,
+                water_loss_weight=0.2,
+            )
+
+
+class ValidationStub(nn.Module):
+    def __init__(self, outputs):
+        super().__init__()
+        self.outputs = outputs
+        self.return_aux_requests = []
+
+    def forward(self, image_a, image_b, return_aux=False):
+        self.return_aux_requests.append(return_aux)
+        if return_aux:
+            return self.outputs
+        return self.outputs['change_logits']
+
+
+class AuxiliaryValidationMetricsTest(unittest.TestCase):
+    @staticmethod
+    def _logits(predictions, margin=4.0):
+        logits = torch.full(
+            (predictions.size(0), 2, *predictions.shape[1:]),
+            -margin,
+        )
+        logits.scatter_(1, predictions.unsqueeze(1), margin)
+        return logits
+
+    def _batch(self, water_valid):
+        change = torch.tensor([
+            [[0, 1], [1, 0]],
+            [[1, 0], [0, 1]],
+        ])
+        water_a = torch.tensor([
+            [[0, 1], [1, 0]],
+            [[0, 0], [0, 0]],
+        ])
+        water_b = torch.tensor([
+            [[0, 1], [0, 1]],
+            [[0, 0], [0, 0]],
+        ])
+        water_a_predictions = torch.tensor([
+            [[0, 1], [0, 0]],
+            [[1, 1], [1, 1]],
+        ])
+        water_b_predictions = torch.tensor([
+            [[1, 1], [0, 1]],
+            [[1, 1], [1, 1]],
+        ])
+        outputs = {
+            'change_logits': self._logits(change),
+            'water_a_logits': self._logits(water_a_predictions),
+            'water_b_logits': self._logits(water_b_predictions),
+        }
+        targets = {
+            'change': change,
+            'water_a': water_a,
+            'water_b': water_b,
+            'water_valid': water_valid,
+        }
+        images = torch.zeros(2, 3, 2, 2)
+        batch = (images, images.clone(), targets, ('a.png', 'b.png'))
+        return outputs, batch
+
+    def test_metrics_use_only_valid_water_labels(self):
+        outputs, batch = self._batch(torch.tensor([True, False]))
+        model = ValidationStub(outputs)
+        criterion = nn.CrossEntropyLoss()
+        metrics = validate(
+            model,
+            [batch],
+            criterion,
+            torch.device('cpu'),
+            learning_rate=1e-4,
+            water_loss_weight=0.2,
+        )
+
+        expected_water_loss = criterion(
+            torch.cat((
+                outputs['water_a_logits'][:1],
+                outputs['water_b_logits'][:1],
+            )),
+            torch.cat((
+                batch[2]['water_a'][:1],
+                batch[2]['water_b'][:1],
+            )),
+        )
+        self.assertEqual(model.return_aux_requests, [True])
+        self.assertEqual(metrics['f1_scores'], 1.0)
+        self.assertEqual(metrics['water_supervised_samples'], 1)
+        self.assertEqual(metrics['water_supervision_fraction'], 0.5)
+        self.assertAlmostEqual(metrics['water_losses'], expected_water_loss.item())
+        self.assertAlmostEqual(metrics['water_a_precision'], 1.0)
+        self.assertAlmostEqual(metrics['water_a_recall'], 0.5)
+        self.assertAlmostEqual(metrics['water_a_f1'], 2 / 3)
+        self.assertAlmostEqual(metrics['water_a_iou'], 0.5)
+        self.assertAlmostEqual(metrics['water_b_precision'], 2 / 3)
+        self.assertAlmostEqual(metrics['water_b_recall'], 1.0)
+        self.assertAlmostEqual(metrics['water_b_f1'], 0.8)
+        self.assertAlmostEqual(metrics['water_b_iou'], 2 / 3)
+        self.assertAlmostEqual(metrics['water_pooled_precision'], 0.75)
+        self.assertAlmostEqual(metrics['water_pooled_recall'], 0.75)
+        self.assertAlmostEqual(metrics['water_pooled_f1'], 0.75)
+        self.assertAlmostEqual(metrics['water_pooled_iou'], 0.6)
+
+    def test_unlabeled_validation_skips_auxiliary_forward_and_metrics(self):
+        outputs, batch = self._batch(torch.tensor([False, False]))
+        model = ValidationStub(outputs)
+        metrics = validate(
+            model,
+            [batch],
+            nn.CrossEntropyLoss(),
+            torch.device('cpu'),
+            learning_rate=1e-4,
+            water_loss_weight=0.2,
+        )
+
+        self.assertEqual(model.return_aux_requests, [False])
+        self.assertEqual(metrics['water_supervised_samples'], 0)
+        self.assertEqual(metrics['water_supervision_fraction'], 0.0)
+        self.assertEqual(metrics['water_losses'], 0.0)
+        self.assertFalse(any(key.startswith('water_a_') for key in metrics))
+        self.assertFalse(any(key.startswith('water_b_') for key in metrics))
+        self.assertFalse(any(key.startswith('water_pooled_') for key in metrics))
+
+
+class TrainingMetricAggregationTest(unittest.TestCase):
+    def _record_batch(
+        self,
+        metrics,
+        *,
+        water_loss,
+        supervised_samples,
+        batch_size,
+    ):
+        return set_metrics(
+            metrics,
+            total_loss=torch.tensor(1.0 + 0.2 * water_loss),
+            overall_accuracy=torch.tensor(1.0),
+            report=(1.0, 1.0, 1.0, None),
+            lr=[1e-4],
+            change_loss=torch.tensor(1.0),
+            water_loss=torch.tensor(water_loss),
+            water_loss_weight=0.2,
+            water_supervised_samples=supervised_samples,
+            batch_size=batch_size,
+        )
+
+    def test_sparse_water_metrics_are_sample_weighted(self):
+        metrics = initialize_metrics()
+        self._record_batch(
+            metrics,
+            water_loss=1.0,
+            supervised_samples=4,
+            batch_size=4,
+        )
+        self._record_batch(
+            metrics,
+            water_loss=0.0,
+            supervised_samples=0,
+            batch_size=1,
+        )
+
+        mean = get_mean_metrics(metrics)
+        self.assertEqual(mean['water_supervised_samples'], 4)
+        self.assertAlmostEqual(mean['water_supervision_fraction'], 4 / 5)
+        self.assertAlmostEqual(mean['water_losses'], 1.0)
+        self.assertAlmostEqual(mean['weighted_water_losses'], 0.2)
+
+    def test_water_loss_is_weighted_by_valid_sample_count(self):
+        metrics = initialize_metrics()
+        self._record_batch(
+            metrics,
+            water_loss=2.0,
+            supervised_samples=1,
+            batch_size=4,
+        )
+        self._record_batch(
+            metrics,
+            water_loss=1.0,
+            supervised_samples=2,
+            batch_size=2,
+        )
+
+        mean = get_mean_metrics(metrics)
+        self.assertAlmostEqual(mean['water_losses'], 4 / 3)
+        self.assertAlmostEqual(mean['weighted_water_losses'], 0.8 / 3)
+        self.assertAlmostEqual(mean['water_supervision_fraction'], 3 / 6)
+
+    def test_unlabeled_epoch_reports_zero_auxiliary_metrics(self):
+        metrics = initialize_metrics()
+        self._record_batch(
+            metrics,
+            water_loss=0.0,
+            supervised_samples=0,
+            batch_size=3,
+        )
+        mean = get_mean_metrics(metrics)
+        self.assertEqual(mean['water_losses'], 0.0)
+        self.assertEqual(mean['weighted_water_losses'], 0.0)
+        self.assertEqual(mean['water_supervision_fraction'], 0.0)
 
 
 class OptimizerSelectionTest(unittest.TestCase):
@@ -181,6 +515,21 @@ class TrainingParserTest(unittest.TestCase):
         self.assertEqual(args.validation_interval, 10)
         self.assertEqual(args.early_stopping_patience, 3)
         self.assertEqual(args.min_f1_improvement, 0.001)
+        self.assertEqual(args.water_loss_weight, 0.2)
+
+    def test_legacy_metadata_defaults_auxiliary_weight(self):
+        metadata_path = Path(__file__).parents[1] / 'metadata_file.json'
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        metadata.pop('water_loss_weight')
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / 'metadata.json'
+            legacy_path.write_text(
+                json.dumps(metadata),
+                encoding='utf-8',
+            )
+            parser, _ = parser_with_args(str(legacy_path))
+            args = parser.parse_args([])
+        self.assertEqual(args.water_loss_weight, 0.2)
 
     def test_training_control_overrides(self):
         parser, _ = parser_with_args()
@@ -190,12 +539,14 @@ class TrainingParserTest(unittest.TestCase):
             '--validation-interval', '20',
             '--early-stopping-patience', '5',
             '--min-f1-improvement', '0.005',
+            '--water-loss-weight', '0.35',
         ])
         self.assertEqual(args.epochs, 500)
         self.assertEqual(args.batch_size, 4)
         self.assertEqual(args.validation_interval, 20)
         self.assertEqual(args.early_stopping_patience, 5)
         self.assertEqual(args.min_f1_improvement, 0.005)
+        self.assertEqual(args.water_loss_weight, 0.35)
 
     def test_paper_repro_config_accepts_fixed_epochs_and_disabled_early_stop(self):
         parser, _ = parser_with_args()
@@ -218,6 +569,12 @@ class TrainingParserTest(unittest.TestCase):
             parser.parse_args(['--validation-interval', '0'])
         with self.assertRaises(SystemExit):
             parser.parse_args(['--early-stopping-patience', '-1'])
+
+    def test_rejects_invalid_water_loss_weights(self):
+        parser, _ = parser_with_args()
+        for value in ('-0.1', 'nan', 'inf', '-inf'):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                parser.parse_args(['--water-loss-weight', value])
 
 
 if __name__ == '__main__':

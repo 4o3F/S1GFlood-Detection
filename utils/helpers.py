@@ -9,8 +9,20 @@ from networks import DAMNet_New
 
 def get_loaders(opt):
     train_full_load, val_full_load = train_path(opt.dataset_dir)
-    train_dataset = FloodDetection(train_full_load, flag='train', aug=opt.augmentation)
-    val_dataset = FloodDetection(val_full_load, flag='val', aug=False)
+    train_dataset = FloodDetection(
+        train_full_load,
+        flag='train',
+        aug=opt.augmentation,
+        include_water=True,
+        load_water_labels=opt.water_loss_weight > 0,
+    )
+    val_dataset = FloodDetection(
+        val_full_load,
+        flag='val',
+        aug=False,
+        include_water=True,
+        load_water_labels=opt.water_loss_weight > 0,
+    )
 
     train_loader = torch.utils.data.DataLoader(train_dataset,batch_size=opt.batch_size,shuffle=True,num_workers=opt.num_workers,pin_memory=True)
     val_loader = torch.utils.data.DataLoader(val_dataset,batch_size=opt.batch_size,shuffle=False,num_workers=opt.num_workers,pin_memory=True)
@@ -69,8 +81,14 @@ class FocalLoss(nn.Module):
 
 def dice_loss(logits, true, eps=1e-7):
     num_classes = logits.shape[1]
+    labels = true.squeeze(1) if true.ndim == logits.ndim else true
+    if labels.ndim != logits.ndim - 1:
+        raise ValueError(
+            'segmentation targets must have shape [N,H,W] or [N,1,H,W]'
+        )
+
     if num_classes == 1:
-        true_1_hot = torch.eye(num_classes + 1, device=true.device)[true.squeeze(1)]
+        true_1_hot = torch.eye(num_classes + 1, device=true.device)[labels]
         true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
         true_1_hot_f = true_1_hot[:, 0:1, :, :]
         true_1_hot_s = true_1_hot[:, 1:2, :, :]
@@ -78,17 +96,17 @@ def dice_loss(logits, true, eps=1e-7):
         pos_prob = torch.sigmoid(logits)
         neg_prob = 1 - pos_prob
         probas = torch.cat([pos_prob, neg_prob], dim=1)
-
     else:
-        true_1_hot = torch.eye(num_classes, device=true.device)[true.squeeze(1)]
+        true_1_hot = torch.eye(num_classes, device=true.device)[labels]
         true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
         probas = F.softmax(logits, dim=1)
+
     true_1_hot = true_1_hot.type(logits.type())
-    dims = (0,) + tuple(range(2, true.ndimension()))
+    dims = (0,) + tuple(range(2, probas.ndimension()))
     intersection = torch.sum(probas * true_1_hot, dims)
     cardinality = torch.sum(probas + true_1_hot, dims)
-    dice_loss = (2. * intersection / (cardinality + eps)).mean()
-    return (1 - dice_loss)
+    score = (2. * intersection / (cardinality + eps)).mean()
+    return 1 - score
 
 
 def hybrid_loss(predictions, target):
@@ -116,21 +134,97 @@ def get_criterion(opt):
 
 
 def initialize_metrics():
-    metrics = {'losses': [], 'overall_accuracy': [],'precisions': [],'recalls': [],'f1_scores': [],'learning_rate': []}
-    return metrics
+    return {
+        'losses': [],
+        'change_losses': [],
+        'water_losses': [],
+        'weighted_water_losses': [],
+        'water_supervised_samples': [],
+        'water_supervision_fraction': [],
+        'overall_accuracy': [],
+        'precisions': [],
+        'recalls': [],
+        'f1_scores': [],
+        'learning_rate': [],
+        '_batch_sizes': [],
+    }
+
 
 def get_mean_metrics(metric_dict):
-    return {k: np.mean(v) for k, v in metric_dict.items()}
+    supervised_counts = metric_dict['water_supervised_samples']
+    supervised_samples = int(np.sum(supervised_counts))
+    total_samples = int(np.sum(metric_dict['_batch_sizes']))
+    water_loss_sum = sum(
+        loss * count
+        for loss, count in zip(
+            metric_dict['water_losses'],
+            supervised_counts,
+        )
+    )
+    weighted_water_loss_sum = sum(
+        loss * count
+        for loss, count in zip(
+            metric_dict['weighted_water_losses'],
+            supervised_counts,
+        )
+    )
+
+    metrics = {
+        key: np.mean(values)
+        for key, values in metric_dict.items()
+        if not key.startswith('_')
+        and key not in {
+            'water_losses',
+            'weighted_water_losses',
+            'water_supervised_samples',
+            'water_supervision_fraction',
+        }
+    }
+    metrics['water_losses'] = (
+        water_loss_sum / supervised_samples
+        if supervised_samples
+        else 0.0
+    )
+    metrics['weighted_water_losses'] = (
+        weighted_water_loss_sum / supervised_samples
+        if supervised_samples
+        else 0.0
+    )
+    metrics['water_supervised_samples'] = supervised_samples
+    metrics['water_supervision_fraction'] = (
+        supervised_samples / total_samples
+        if total_samples
+        else 0.0
+    )
+    return metrics
 
 
-def set_metrics(metric_dict, cd_loss, overall_accuracy, report, lr):
-    metric_dict['losses'].append(cd_loss.item())
+def set_metrics(
+    metric_dict,
+    total_loss,
+    overall_accuracy,
+    report,
+    lr,
+    *,
+    change_loss,
+    water_loss,
+    water_loss_weight,
+    water_supervised_samples,
+    batch_size,
+):
+    metric_dict['losses'].append(total_loss.item())
+    metric_dict['change_losses'].append(change_loss.item())
+    metric_dict['water_losses'].append(water_loss.item())
+    metric_dict['weighted_water_losses'].append(
+        water_loss_weight * water_loss.item()
+    )
+    metric_dict['water_supervised_samples'].append(water_supervised_samples)
+    metric_dict['_batch_sizes'].append(batch_size)
     metric_dict['learning_rate'].append(lr)
     metric_dict['overall_accuracy'].append(overall_accuracy.item())
     metric_dict['precisions'].append(report[0])
     metric_dict['recalls'].append(report[1])
     metric_dict['f1_scores'].append(report[2])
-
 
     return metric_dict
 

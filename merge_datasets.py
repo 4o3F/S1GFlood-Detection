@@ -1,7 +1,8 @@
 """Merge multiple prepared dataset roots into one for joint training.
 
-Each input must be a prepared root with ``{train,val,test}/{A,B,GT}/<name>.png``
-(the layout produced by ``prepare_dataset.py`` and ``prepare_etci_pairs.py``).
+Each input must be a prepared root with ``{train,val,test}/{A,B,GT}/<name>.png``.
+Splits may additionally contain sparse, paired ``WATER_GT_A/WATER_GT_B`` masks.
+Missing both water masks means change-only supervision; labels are never fabricated.
 Files are combined via hardlink/copy/symlink into a single output root that is
 a drop-in ``--dataset-dir`` for ``train.py``/``eval.py``. The training loader
 shuffles, so samples from every source are interleaved each epoch.
@@ -20,18 +21,23 @@ import argparse
 import errno
 import json
 import os
+import re
 import shutil
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
 SPLITS = ("train", "val", "test")
-SUBDIRS = ("A", "B", "GT")
+REQUIRED_SUBDIRS = ("A", "B", "GT")
+WATER_SUBDIRS = ("WATER_GT_A", "WATER_GT_B")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
-MERGE_VERSION = "1.0.0"
+ALLOWED_MASK_VALUES = {0, 1, 255}
+MERGE_VERSION = "1.1.0"
 
 _hardlink_copy_fallback = 0
 
@@ -96,6 +102,57 @@ def resolve_root(path: Path) -> Path:
     )
 
 
+def _binary_mask_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        size = image.size
+        array = np.asarray(image)
+
+    if array.ndim == 3:
+        if array.shape[2] != 3 or not (
+            np.array_equal(array[..., 0], array[..., 1])
+            and np.array_equal(array[..., 0], array[..., 2])
+        ):
+            raise ValueError(f"mask RGB channels must be identical: {path}")
+        array = array[..., 0]
+    elif array.ndim != 2:
+        raise ValueError(f"unsupported mask shape {array.shape}: {path}")
+
+    values = set(np.unique(array).tolist())
+    if not values.issubset(ALLOWED_MASK_VALUES):
+        raise ValueError(
+            f"mask must contain only {{0,1,255}}, found {sorted(values)}: {path}"
+        )
+    return size
+
+
+def _validate_water_pair(
+    image_a: Path,
+    image_b: Path,
+    water_a: Path,
+    water_b: Path,
+    sample: str,
+) -> None:
+    with Image.open(image_a) as image:
+        image_a_size = image.size
+    with Image.open(image_b) as image:
+        image_b_size = image.size
+    if image_a_size != image_b_size:
+        raise ValueError(
+            f"A/B image size mismatch for {sample}: "
+            f"A={image_a_size}, B={image_b_size}"
+        )
+
+    water_sizes = {
+        "WATER_GT_A": _binary_mask_size(water_a),
+        "WATER_GT_B": _binary_mask_size(water_b),
+    }
+    if any(size != image_a_size for size in water_sizes.values()):
+        raise ValueError(
+            f"image/water-label size mismatch for {sample}: "
+            f"image={image_a_size}, labels={water_sizes}"
+        )
+
+
 def _materialize(source: Path, destination: Path, mode: str) -> None:
     global _hardlink_copy_fallback
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -115,27 +172,76 @@ def _materialize(source: Path, destination: Path, mode: str) -> None:
 
 
 def _scan_source(root: Path, tag: str):
-    """Return {split: {basename: {A,B,GT paths}}} for the splits present."""
+    """Return required paths plus sparse, paired water-label paths."""
     out = {}
     for split in SPLITS:
-        a_dir = root / split / "A"
+        split_root = root / split
+        a_dir = split_root / "A"
         if not a_dir.is_dir():
             continue
+
         names = _list_images(a_dir)
+        sample_names = set(names)
+        water_a_dir = split_root / WATER_SUBDIRS[0]
+        water_b_dir = split_root / WATER_SUBDIRS[1]
+        water_a_exists = water_a_dir.is_dir()
+        water_b_exists = water_b_dir.is_dir()
+        if water_a_exists != water_b_exists:
+            missing = water_b_dir if water_a_exists else water_a_dir
+            raise FileNotFoundError(
+                f"source {tag}: water-label directories must exist as a pair; "
+                f"missing {missing}"
+            )
+
+        water_names = set()
+        if water_a_exists:
+            water_a_names = set(_list_images(water_a_dir))
+            water_b_names = set(_list_images(water_b_dir))
+            if water_a_names != water_b_names:
+                only_a = sorted(water_a_names - water_b_names)
+                only_b = sorted(water_b_names - water_a_names)
+                raise FileNotFoundError(
+                    f"source {tag}: {split} water labels must exist as pairs; "
+                    f"only WATER_GT_A={only_a[:1]}, only WATER_GT_B={only_b[:1]}"
+                )
+            orphan_names = sorted(water_a_names - sample_names)
+            if orphan_names:
+                raise ValueError(
+                    f"source {tag}: {split} orphan water label {orphan_names[0]}"
+                )
+            water_names = water_a_names
+
         entries = {}
         for name in names:
-            a_path = root / split / "A" / name
-            b_path = root / split / "B" / name
-            gt_path = root / split / "GT" / name
+            a_path = split_root / "A" / name
+            b_path = split_root / "B" / name
+            gt_path = split_root / "GT" / name
             if not (b_path.is_file() and gt_path.is_file()):
                 raise FileNotFoundError(
                     f"source {tag}: {split}/{name} is missing its B or GT pair"
                 )
-            entries[name] = {"A": a_path, "B": b_path, "GT": gt_path}
+            paths = {"A": a_path, "B": b_path, "GT": gt_path}
+            if name in water_names:
+                water_a_path = water_a_dir / name
+                water_b_path = water_b_dir / name
+                _validate_water_pair(
+                    a_path,
+                    b_path,
+                    water_a_path,
+                    water_b_path,
+                    f"{tag}:{split}/{name}",
+                )
+                paths[WATER_SUBDIRS[0]] = water_a_path
+                paths[WATER_SUBDIRS[1]] = water_b_path
+            entries[name] = paths
         out[split] = entries
     if not out:
         raise FileNotFoundError(f"source {tag}: no train/val/test/A directories under {root}")
     return out
+
+
+def _renamed_basename(tag: str, name: str) -> str:
+    return f"{len(tag)}__{tag}__{name}"
 
 
 def build_plan(roots, tags, on_collision: str):
@@ -144,9 +250,9 @@ def build_plan(roots, tags, on_collision: str):
     plan: {split: [ {tag, basename, paths} ] }
     collisions: {split: [(basename, [tags])] }
 
-    In rename mode every file is re-namespaced to ``{tag}__{name}`` so sources
-    never collide; in fail mode basenames are kept as-is and any cross-source
-    clash is reported (merge() then aborts).
+    In rename mode every file receives a length-prefixed source namespace so
+    tag/name delimiter text cannot create an ambiguous basename. In fail mode,
+    basenames are kept as-is and any cross-source clash is reported.
     """
     plan = {split: [] for split in SPLITS}
     collisions = {split: [] for split in SPLITS}
@@ -156,7 +262,11 @@ def build_plan(roots, tags, on_collision: str):
         scan = _scan_source(root, tag)
         for split, entries in scan.items():
             for name, paths in entries.items():
-                final_name = f"{tag}__{name}" if on_collision == "rename" else name
+                final_name = (
+                    _renamed_basename(tag, name)
+                    if on_collision == "rename"
+                    else name
+                )
                 if final_name in seen[split]:
                     collisions[split].append(
                         (final_name, [seen[split][final_name], tag])
@@ -169,31 +279,57 @@ def build_plan(roots, tags, on_collision: str):
 
 
 def _materialize_plan(plan, staging_root: Path, mode: str, on_collision: str):
-    total = sum(len(items) for items in plan.values()) * len(SUBDIRS)
+    total = sum(
+        len(item["paths"])
+        for items in plan.values()
+        for item in items
+    )
     with tqdm(total=total, unit="file", desc="Merging") as progress:
         for split in SPLITS:
             for item in plan[split]:
-                for sub in SUBDIRS:
+                for subdirectory, source in item["paths"].items():
                     _materialize(
-                        item["paths"][sub],
-                        staging_root / split / sub / item["basename"],
+                        source,
+                        staging_root / split / subdirectory / item["basename"],
                         mode,
                     )
                     progress.update(1)
 
 
-def _ensure_split_dirs(staging_root: Path) -> None:
+def _ensure_split_dirs(staging_root: Path, plan) -> None:
     for split in SPLITS:
-        for sub in SUBDIRS:
-            (staging_root / split / sub).mkdir(parents=True, exist_ok=True)
+        for subdirectory in REQUIRED_SUBDIRS:
+            (staging_root / split / subdirectory).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+        if any(WATER_SUBDIRS[0] in item["paths"] for item in plan[split]):
+            for subdirectory in WATER_SUBDIRS:
+                (staging_root / split / subdirectory).mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
 
 
 def _write_manifest(staging_root, plan, collisions, sources, args):
     per_split = {split: len(items) for split, items in plan.items()}
-    per_source = {tag: {split: 0 for split in SPLITS} for tag in [s[1] for s in sources]}
+    water_per_split = {
+        split: sum(WATER_SUBDIRS[0] in item["paths"] for item in items)
+        for split, items in plan.items()
+    }
+    per_source = {
+        tag: {split: 0 for split in SPLITS}
+        for _, tag in sources
+    }
+    water_per_source = {
+        tag: {split: 0 for split in SPLITS}
+        for _, tag in sources
+    }
     for split, items in plan.items():
         for item in items:
             per_source[item["tag"]][split] += 1
+            if WATER_SUBDIRS[0] in item["paths"]:
+                water_per_source[item["tag"]][split] += 1
     collision_total = sum(len(v) for v in collisions.values())
     manifest = {
         "tool": "merge_datasets.py",
@@ -204,6 +340,8 @@ def _write_manifest(staging_root, plan, collisions, sources, args):
         "on_collision": args.on_collision,
         "counts_per_split": per_split,
         "counts_per_source": per_source,
+        "water_supervised_counts_per_split": water_per_split,
+        "water_supervised_counts_per_source": water_per_source,
         "collisions_detected": collision_total,
         "hardlink_copy_fallback": _hardlink_copy_fallback,
     }
@@ -211,6 +349,16 @@ def _write_manifest(staging_root, plan, collisions, sources, args):
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     return manifest
+
+
+def _validate_tags(tags) -> None:
+    if len(set(tags)) != len(tags):
+        raise ValueError("--tag values must be unique")
+    for tag in tags:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+            raise ValueError(
+                f"invalid source tag {tag!r}; use letters, digits, '.', '_', or '-'"
+            )
 
 
 def merge(args: argparse.Namespace) -> dict:
@@ -228,6 +376,7 @@ def merge(args: argparse.Namespace) -> dict:
         seen = {}
         for path in args.input:
             base = Path(path).expanduser().name or "input"
+            base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "input"
             if base in seen:
                 seen[base] += 1
                 base = f"{base}_{seen[base]}"
@@ -236,30 +385,42 @@ def merge(args: argparse.Namespace) -> dict:
             tags.append(base)
     if len(tags) != len(roots):
         raise ValueError("number of --tag values must match number of --input roots")
+    _validate_tags(tags)
     sources = list(zip(roots, tags))
 
     plan, collisions = build_plan(roots, tags, args.on_collision)
     collision_total = sum(len(v) for v in collisions.values())
-    if collision_total and args.on_collision == "fail":
+    if collision_total:
         sample = next((s, n, ts) for s, lst in collisions.items() for n, ts in lst[:1])
+        suggestion = (
+            "Use --on-collision rename with unique --tag values."
+            if args.on_collision == "fail"
+            else "Choose different unique --tag values."
+        )
         raise ValueError(
             f"{collision_total} cross-source filename collisions; first: "
-            f"{sample[0]}/{sample[1]} shared by {sample[2]}. "
-            "Use --on-collision rename (with --tag) to re-namespace."
+            f"{sample[0]}/{sample[1]} shared by {sample[2]}. {suggestion}"
         )
 
     per_split = {split: len(items) for split, items in plan.items()}
+    water_per_split = {
+        split: sum(WATER_SUBDIRS[0] in item["paths"] for item in items)
+        for split, items in plan.items()
+    }
     print(f"Sources: {len(roots)}")
     for root, tag in sources:
         print(f"  [{tag}] {root}")
     for split in SPLITS:
         print(f"  {split}: {per_split[split]} samples")
-    if collision_total:
-        print(f"  collisions renamed: {collision_total}")
+        print(f"    paired water labels: {water_per_split[split]}")
 
     if args.dry_run:
         print("Dry run completed; no files were created.")
-        return {"dry_run": True, "counts_per_split": per_split}
+        return {
+            "dry_run": True,
+            "counts_per_split": per_split,
+            "water_supervised_counts_per_split": water_per_split,
+        }
 
     output = args.output.expanduser().resolve()
     if output.exists():
@@ -272,7 +433,7 @@ def merge(args: argparse.Namespace) -> dict:
 
     staging.mkdir(parents=True)
     try:
-        _ensure_split_dirs(staging)
+        _ensure_split_dirs(staging, plan)
         _materialize_plan(plan, staging, args.mode, args.on_collision)
         manifest = _write_manifest(staging, plan, collisions, sources, args)
         os.replace(staging, output)

@@ -169,6 +169,26 @@ An overview of the proposed DAM-Net. The feature maps of the pre-and post-event 
               │   │       └── <region><year><XY>.png
               │  
 
+Each split may optionally provide paired full-water masks for auxiliary
+supervision:
+
+```text
+<split>/
+├── A/<name>.png
+├── B/<name>.png
+├── GT/<name>.png
+├── WATER_GT_A/<name>.png   # all water visible in A
+└── WATER_GT_B/<name>.png   # all water visible in B
+```
+
+`WATER_GT_A` and `WATER_GT_B` are sparse but strictly paired: both directories
+must exist together, and a supervised basename must exist in both. Samples
+without either water mask remain valid change-only samples; the loader uses an
+explicit validity flag and never interprets a missing mask as all-background.
+Masks may use binary `{0, 1}` or `{0, 255}` values and must match the A/B image
+size. S1GFloods can therefore be mixed with datasets that provide full-water
+labels without fabricating auxiliary targets for S1GFloods.
+
 If the downloaded dataset contains flat `A/`, `B/`, and `Label/` directories, prepare the required layout with:
 
 ```shell
@@ -299,7 +319,7 @@ uv run python merge_datasets.py \
   --mode hardlink
 ```
 
-Each `--input` must be a prepared root with `{train,val,test}/{A,B,GT}`. `--mode hardlink` combines sources without duplicating file data (falls back to copy across filesystems). Cross-source filename collisions are rejected by default; ETCI pairs are prefixed `etci_`, so S1GFloods and ETCI never collide. Use `--on-collision rename` (with `--tag NAME` per input) to re-namespace when sources share names, and `--dry-run` to preview counts first. The merged root is a drop-in `--dataset-dir`:
+Each `--input` must be a prepared root with `{train,val,test}/{A,B,GT}`. Optional paired `WATER_GT_A/WATER_GT_B` masks are propagated sparsely, and the merge manifest records supervised counts per split and source; no placeholder label files are created. `--mode hardlink` combines sources without duplicating file data (falls back to copy across filesystems). Cross-source filename collisions are rejected by default; ETCI pairs are prefixed `etci_`, so S1GFloods and ETCI never collide. Use `--on-collision rename` (with a unique `--tag NAME` per input) to re-namespace all sample files, including water masks, when sources share names. Rename mode uses an unambiguous length-prefixed namespace such as `2__s1__<name>`. Use `--dry-run` to preview sample and paired-water counts first. The merged root is a drop-in `--dataset-dir`:
 
 ```shell
 uv run python train.py --dataset-dir /path/to/merged
@@ -335,10 +355,28 @@ You can download our novel public S1GFloods dataset through the following link:
 
   Checkpoint epoch numbers are one-based, for example `checkpoint_epoch_10.pth`.
 
+  When paired `WATER_GT_A/WATER_GT_B` masks are available, one shared lightweight
+  segmentation head predicts all water independently for A and B. The head
+  branches directly from each single-temporal backbone feature map and bypasses
+  tokenization, Transformer, CTCA, TACE, TDF, and other multi-temporal fusion.
+  The main change loss still uses every sample, while the auxiliary loss uses
+  only samples whose paired water masks are present:
+
+  ```text
+  total_loss = change_loss + water_loss_weight * water_loss
+  ```
+
+  The default auxiliary weight is `0.2`; set it to `0` to disable auxiliary
+  computation and recover main-task-only training. Best-checkpoint selection and
+  early stopping remain controlled exclusively by validation flood-change F1,
+  not by the auxiliary water metrics.
+
   The dataset directory can also be passed directly to the Python entry point:
 
   ```shell
-  uv run python train.py --dataset-dir /path/to/S1GFloods
+  uv run python train.py \
+    --dataset-dir /path/to/merged \
+    --water-loss-weight 0.2
   ```
 
 - Testing
