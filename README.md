@@ -204,11 +204,24 @@ For large datasets, `--mode hardlink` avoids duplicating file data when source a
 
 ### ETCI-2021 temporal pairs
 
-The [ETCI-2021 Flood Detection](https://huggingface.co/datasets/blanchon/ETCI-2021-Flood-Detection) dataset ships per-date Sentinel-1 VV/VH tiles plus RGB flood masks. Several regions are captured on multiple dates, so a single offline converter, `prepare_etci_pairs.py`, reorganizes them into the same bi-temporal `train/val/test` `{A, B, GT}` layout as S1GFloods:
+The [ETCI-2021 Flood Detection](https://huggingface.co/datasets/blanchon/ETCI-2021-Flood-Detection) dataset ships per-date Sentinel-1 VV/VH tiles plus separate RGB `flood_label` and `water_body_label` masks. Several regions are captured on multiple dates, so the offline converter `prepare_etci_pairs.py` reorganizes them into the same five-directory bi-temporal contract used by the training pipeline:
+
+```text
+<split>/
+├── A/<name>.png
+├── B/<name>.png
+├── GT/<name>.png
+├── WATER_GT_A/<name>.png
+└── WATER_GT_B/<name>.png
+```
 
 - **A** = earlier-date VV tile for a `(region, x, y)` coordinate
 - **B** = later-date VV tile for the same coordinate
-- **GT** = later-date `flood_label`, rewritten to single-channel mode-L `{0, 255}` (always re-encoded, never hardlinked from the RGB source)
+- **GT** = later-date `flood_label` (the main change-task semantics are unchanged)
+- **WATER_GT_A** = earlier-date `water_body_label OR flood_label`
+- **WATER_GT_B** = later-date `water_body_label OR flood_label`
+
+All three output masks are rewritten as canonical single-channel mode-L PNGs with values `{0, 255}`. The derived water targets are always materialized from the two source masks and are never hardlinked from either RGB label.
 
 ```shell
 uv run python prepare_etci_pairs.py \
@@ -220,7 +233,7 @@ uv run python prepare_etci_pairs.py \
   --mode hardlink
 ```
 
-`--download` fetches the pinned Hugging Face revision into the cache; pass `--source /path/to/etci_repo` instead to convert an already-downloaded copy. Use `--dry-run` to inspect the planned pair counts and skip reasons before creating output.
+`--download` fetches the pinned Hugging Face revision into the cache; pass `--source /path/to/etci_repo` instead to convert an already-downloaded copy. A source observation is eligible only when matching VV, `flood_label`, and `water_body_label` files exist for the same scene and coordinate. Use `--dry-run` to inspect the planned pair counts and skip reasons before creating output. A partial mirror with only one populated VV date per region can validate its input contract but cannot produce a temporal pair; in that case the converter reports `no temporal pairs produced` and publishes nothing.
 
 If `huggingface.co` is unreachable or slow, route the download through a mirror with `--hf-endpoint https://hf-mirror.com` (also honored from the `HF_ENDPOINT` environment variable). The endpoint is passed explicitly to `snapshot_download`, so it does not depend on the variable being exported into the process.
 

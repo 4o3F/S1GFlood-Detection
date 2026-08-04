@@ -2,9 +2,11 @@
 
 Standalone offline converter. For each output sample::
 
-    A  = earlier-date VV for the same region and tile coordinate
-    B  = later-date VV for the same region and tile coordinate
-    GT = later-date flood_label, rewritten to single-channel PNG mode L {0,255}
+    A          = earlier-date VV for the same region and tile coordinate
+    B          = later-date VV for the same region and tile coordinate
+    GT         = later-date flood_label, canonical mode L {0,255}
+    WATER_GT_A = earlier water_body_label OR earlier flood_label
+    WATER_GT_B = later water_body_label OR later flood_label
 
 The output directory is a drop-in root for the existing ``utils.dataloaders``
 loader; no training or model code is modified.
@@ -24,6 +26,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
 from utils.etci_temporal import (
@@ -31,6 +35,7 @@ from utils.etci_temporal import (
     assign_all_to_split,
     assign_train_val_groups,
     build_temporal_pairs,
+    compose_full_water_mask,
     finalize_assignments,
     index_labeled_split,
     inspect_test_internal,
@@ -39,7 +44,9 @@ from utils.etci_temporal import (
 
 DEFAULT_REPO_ID = "blanchon/ETCI-2021-Flood-Detection"
 DEFAULT_REVISION = "921e207ea6aa26e9366fd200725a98b0067f9d6b"
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
+WATER_GT_FORMULA = "water_body_label OR flood_label, per acquisition date"
+OUTPUT_SUBDIRS = ("A", "B", "GT", "WATER_GT_A", "WATER_GT_B")
 SPLIT_STRATEGY = (
     "train pairs group-split into train/val by (region,x,y); "
     "source test pairs to output test; test_internal excluded "
@@ -49,7 +56,9 @@ OUTPUT_SPLITS = ("train", "val", "test")
 PAIR_MANIFEST_COLUMNS = (
     "split,filename,pair_id,region,x,y,pre_scene,post_scene,"
     "pre_datetime,post_datetime,gap_days,pre_flood_pixels,post_flood_pixels,"
-    "policy,pre_vv,post_vv,pre_flood,post_flood"
+    "policy,pre_vv,post_vv,pre_flood,post_flood,pre_water,post_water,"
+    "pre_water_body_pixels,post_water_body_pixels,water_gt_a_pixels,"
+    "water_gt_b_pixels,water_gt_formula"
 )
 
 _hardlink_copy_fallback = 0
@@ -58,8 +67,8 @@ _hardlink_copy_fallback = 0
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert ETCI-2021 multi-date VV scenes into the S1GFloods "
-            "bi-temporal train/val/test A/B/GT layout."
+            "Convert ETCI-2021 multi-date VV scenes into the paired "
+            "A/B/GT/WATER_GT_A/WATER_GT_B train/val/test layout."
         )
     )
     parser.add_argument("--source", type=Path, help="local ETCI repository or data root")
@@ -143,6 +152,14 @@ def resolve_data_root(args: argparse.Namespace) -> Path:
     return find_data_root(args.source)
 
 
+def _trusted_download_root(data_root: Path) -> Path | None:
+    """Return the repository cache root that owns snapshot/blob symlinks."""
+    for parent in data_root.parents:
+        if parent.name == "snapshots":
+            return parent.parent.resolve()
+    return None
+
+
 def _materialize_image(source: Path, destination: Path, mode: str) -> None:
     global _hardlink_copy_fallback
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -150,8 +167,9 @@ def _materialize_image(source: Path, destination: Path, mode: str) -> None:
         shutil.copy2(source, destination)
         return
     if mode == "hardlink":
+        link_source = source.resolve(strict=True) if source.is_symlink() else source
         try:
-            os.link(source, destination)
+            os.link(link_source, destination)
         except OSError as error:
             # EXDEV = cross-device; EPERM/EACCES = link-prohibited volume.
             if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES):
@@ -168,6 +186,18 @@ def _materialize_gt(source: Path, destination: Path) -> None:
     load_binary_flood_mask(source).save(destination, format="PNG")
 
 
+def _materialize_water_gt(
+    water_source: Path,
+    flood_source: Path,
+    destination: Path,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    compose_full_water_mask(water_source, flood_source).save(
+        destination,
+        format="PNG",
+    )
+
+
 def _pair_id(filename: str) -> str:
     return hashlib.sha1(filename.encode("utf-8")).hexdigest()[:12]
 
@@ -178,7 +208,7 @@ def _iso(timestamp: datetime) -> str:
 
 def _rel(path: Path, data_root: Path) -> str:
     try:
-        return str(path.resolve().relative_to(data_root))
+        return str(path.relative_to(data_root))
     except ValueError:
         return str(path)
 
@@ -186,49 +216,88 @@ def _rel(path: Path, data_root: Path) -> str:
 def _materialize_all(
     assigned, staging_root: Path, data_root: Path, mode: str
 ) -> None:
-    total = len(assigned) * 3
+    total = len(assigned) * len(OUTPUT_SUBDIRS)
     with tqdm(total=total, unit="file", desc="Materializing") as progress:
         for item in assigned:
+            pair = item.pair
             split_root = staging_root / item.output_split
             _materialize_image(
-                item.pair.pre_vv_path, split_root / "A" / item.filename, mode
+                pair.pre_vv_path, split_root / "A" / item.filename, mode
             )
             progress.update(1)
             _materialize_image(
-                item.pair.post_vv_path, split_root / "B" / item.filename, mode
+                pair.post_vv_path, split_root / "B" / item.filename, mode
             )
             progress.update(1)
             _materialize_gt(
-                item.pair.post_flood_path, split_root / "GT" / item.filename
+                pair.post_flood_path, split_root / "GT" / item.filename
+            )
+            progress.update(1)
+            _materialize_water_gt(
+                pair.pre_water_path,
+                pair.pre_flood_path,
+                split_root / "WATER_GT_A" / item.filename,
+            )
+            progress.update(1)
+            _materialize_water_gt(
+                pair.post_water_path,
+                pair.post_flood_path,
+                split_root / "WATER_GT_B" / item.filename,
             )
             progress.update(1)
 
 
 def _ensure_split_dirs(staging_root: Path) -> None:
-    """Create the A/B/GT contract directories for every split.
-
-    An empty split (e.g. ``val`` with too few coordinate groups) still gets its
-    directories so downstream loaders that ``os.listdir`` the split do not raise
-    ``FileNotFoundError`` on a missing path.
-    """
+    """Create the five prepared-data directories for every output split."""
     for split_name in OUTPUT_SPLITS:
-        for sub in ("A", "B", "GT"):
-            (staging_root / split_name / sub).mkdir(parents=True, exist_ok=True)
+        for subdirectory in OUTPUT_SUBDIRS:
+            (staging_root / split_name / subdirectory).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+
+def _verify_output_mask(path: Path, expected_size) -> None:
+    with Image.open(path) as image:
+        mode = image.mode
+        size = image.size
+        values = set(np.unique(np.asarray(image)).tolist())
+    if mode != "L":
+        raise RuntimeError(f"output mask must use mode L: {path}")
+    if size != expected_size:
+        raise RuntimeError(
+            f"output mask size mismatch: image={expected_size}, mask={size}, path={path}"
+        )
+    if not values.issubset({0, 255}):
+        raise RuntimeError(f"output mask must contain only {{0,255}}: {path}")
 
 
 def _verify_tree(staging_root: Path) -> None:
     for split_name in OUTPUT_SPLITS:
         split_root = staging_root / split_name
-        if not split_root.is_dir():
-            continue
-        names = []
-        for sub in ("A", "B", "GT"):
-            sub_dir = split_root / sub
-            names.append(
-                {p.name for p in sub_dir.glob("*.png")} if sub_dir.is_dir() else set()
+        name_sets = [
+            {path.name for path in (split_root / subdirectory).glob("*.png")}
+            for subdirectory in OUTPUT_SUBDIRS
+        ]
+        if any(names != name_sets[0] for names in name_sets[1:]):
+            raise RuntimeError(
+                f"prepared basename mismatch in split {split_name}: "
+                f"{dict(zip(OUTPUT_SUBDIRS, map(len, name_sets)))}"
             )
-        if names[0] != names[1] or names[0] != names[2]:
-            raise RuntimeError(f"A/B/GT basename mismatch in split {split_name}")
+
+        for name in sorted(name_sets[0]):
+            with Image.open(split_root / "A" / name) as image_a:
+                image_size = image_a.size
+            with Image.open(split_root / "B" / name) as image_b:
+                if image_b.size != image_size:
+                    raise RuntimeError(
+                        f"A/B image size mismatch in split {split_name}: {name}"
+                    )
+            for subdirectory in ("GT", "WATER_GT_A", "WATER_GT_B"):
+                _verify_output_mask(
+                    split_root / subdirectory / name,
+                    image_size,
+                )
 
 
 def _write_manifests(
@@ -266,6 +335,13 @@ def _write_manifests(
                     _rel(pair.post_vv_path, data_root),
                     _rel(pair.pre_flood_path, data_root),
                     _rel(pair.post_flood_path, data_root),
+                    _rel(pair.pre_water_path, data_root),
+                    _rel(pair.post_water_path, data_root),
+                    pair.pre_water_body_pixels,
+                    pair.post_water_body_pixels,
+                    pair.water_gt_a_pixels,
+                    pair.water_gt_b_pixels,
+                    WATER_GT_FORMULA,
                 ]
             )
 
@@ -287,11 +363,29 @@ def _write_manifests(
         "max": max(gaps) if gaps else None,
         "mean": round(sum(gaps) / len(gaps), 2) if gaps else None,
     }
+    water_pixels = {
+        split_name: {
+            "water_gt_a": sum(
+                item.pair.water_gt_a_pixels
+                for item in assigned
+                if item.output_split == split_name
+            ),
+            "water_gt_b": sum(
+                item.pair.water_gt_b_pixels
+                for item in assigned
+                if item.output_split == split_name
+            ),
+        }
+        for split_name in OUTPUT_SPLITS
+    }
     qc_report = {
         "skip_counts": dict(skip_counts),
         "policy_counts": dict(policy_counts),
         "gap_days": gap_stats,
         "pairs_per_output_split": counts,
+        "water_supervised_pairs_per_output_split": dict(counts),
+        "water_pixels_per_output_split": water_pixels,
+        "water_gt_formula": WATER_GT_FORMULA,
         "index_stats": index_stats,
         "test_internal": test_internal,
         "hardlink_copy_fallback": _hardlink_copy_fallback,
@@ -314,6 +408,10 @@ def _write_manifests(
         "revision": args.revision if args.download else None,
         "pair_policy": args.pair_policy,
         "polarization": "vv",
+        "output_subdirectories": list(OUTPUT_SUBDIRS),
+        "gt_semantics": "post-date flood_label",
+        "water_gt_formula": WATER_GT_FORMULA,
+        "mask_encoding": "single-channel PNG mode L with values {0,255}",
         "val_ratio": args.val_ratio,
         "seed": args.seed,
         "mode": args.mode,
@@ -323,8 +421,10 @@ def _write_manifests(
         "max_saturated_fraction": args.max_saturated_fraction,
         "split_strategy": SPLIT_STRATEGY,
         "counts": counts,
+        "water_supervised_counts": dict(counts),
         "assumptions": [
             "Earlier VV is treated as the pre-event image; later flood_label is GT.",
+            "Each full-water target is derived from water_body_label OR flood_label.",
             "Coordinate equality does not prove strict geographic registration.",
         ],
     }
@@ -346,7 +446,8 @@ def _print_summary(args, data_root, counts, test_internal, skips) -> None:
     if test_internal.get("present"):
         print(
             f"  test_internal: {test_internal['vv_files']} VV, "
-            f"{test_internal['flood_label_files']} flood_label -> "
+            f"{test_internal['flood_label_files']} flood_label, "
+            f"{test_internal['water_body_label_files']} water_body_label -> "
             f"{test_internal.get('excluded_reason') or 'excluded'}"
         )
     if _hardlink_copy_fallback:
@@ -359,6 +460,7 @@ def _stats_dict(stats) -> dict:
         "scenes": stats.scenes,
         "vv_files": stats.vv_files,
         "flood_files": stats.flood_files,
+        "water_files": stats.water_files,
     }
 
 
@@ -368,9 +470,22 @@ def prepare(args: argparse.Namespace) -> dict:
     _validate_args(args)
 
     data_root = resolve_data_root(args)
+    trusted_symlink_root = (
+        _trusted_download_root(data_root)
+        if args.download
+        else None
+    )
 
-    train_observations, train_skips, train_stats = index_labeled_split(data_root, "train")
-    test_observations, test_skips, test_stats = index_labeled_split(data_root, "test")
+    train_observations, train_skips, train_stats = index_labeled_split(
+        data_root,
+        "train",
+        trusted_symlink_root,
+    )
+    test_observations, test_skips, test_stats = index_labeled_split(
+        data_root,
+        "test",
+        trusted_symlink_root,
+    )
     test_internal = inspect_test_internal(data_root)
 
     pair_kwargs = dict(

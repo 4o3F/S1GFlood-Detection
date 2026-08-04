@@ -1,7 +1,7 @@
 """ETCI-2021 bi-temporal pairing domain logic.
 
 Pure functions for parsing ETCI scene/tile names, indexing labeled splits,
-normalizing flood masks, running lightweight VV quality control, building
+normalizing binary masks, running lightweight VV quality control, building
 cross-date temporal pairs, and assigning output splits. No argparse, no
 PyTorch, no network: this module is intentionally easy to unit-test and to
 reuse from the offline converter and any future in-memory loader.
@@ -32,7 +32,7 @@ FLOOD_RE = re.compile(
     r"^(?P<scene>.+)_x-(?P<x>-?\d+)_y-(?P<y>-?\d+)(?:_vv)?\.png$", re.IGNORECASE
 )
 TIMESTAMP_FORMAT = "%Y%m%dt%H%M%S"
-_ALLOWED_FLOOD_VALUES = {0, 1, 255}
+_ALLOWED_MASK_VALUES = {0, 1, 255}
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,7 @@ class TileObservation:
     y: int
     vv_path: Path
     flood_path: Path
+    water_path: Path
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,14 @@ class TemporalPair:
     post_vv_path: Path
     pre_flood_path: Path
     post_flood_path: Path
+    pre_water_path: Path
+    post_water_path: Path
     pre_flood_pixels: int
     post_flood_pixels: int
+    pre_water_body_pixels: int
+    post_water_body_pixels: int
+    water_gt_a_pixels: int
+    water_gt_b_pixels: int
     gap_days: int
     policy: str
 
@@ -80,6 +87,7 @@ class IndexStats:
     scenes: int = 0
     vv_files: int = 0
     flood_files: int = 0
+    water_files: int = 0
 
 
 def parse_scene_name(name: str) -> Optional[Tuple[str, datetime]]:
@@ -100,15 +108,23 @@ def parse_vv_filename(name: str) -> Optional[Tuple[str, int, int]]:
     return match.group("scene"), int(match.group("x")), int(match.group("y"))
 
 
-def parse_flood_filename(name: str) -> Optional[Tuple[str, int, int]]:
+def _parse_label_filename(name: str, label_name: str) -> Optional[Tuple[str, int, int]]:
     if FLOOD_VH_RE.match(name):
         raise ValueError(
-            f"vh-polarized flood label is not a valid VV ground truth: {name}"
+            f"vh-polarized {label_name} is not valid VV ground truth: {name}"
         )
     match = FLOOD_RE.match(name)
     if not match:
         return None
     return match.group("scene"), int(match.group("x")), int(match.group("y"))
+
+
+def parse_flood_filename(name: str) -> Optional[Tuple[str, int, int]]:
+    return _parse_label_filename(name, "flood label")
+
+
+def parse_water_filename(name: str) -> Optional[Tuple[str, int, int]]:
+    return _parse_label_filename(name, "water-body label")
 
 
 def _scene_token(scene: str) -> str:
@@ -121,34 +137,52 @@ def build_filename(pair: TemporalPair) -> str:
     return f"etci_{pair.region}_x-{pair.x}_y-{pair.y}_{pre_token}_{post_token}_vv.png"
 
 
-def load_binary_flood_mask(path: Path) -> Image.Image:
-    """Return a mode-L binary mask with values in {0, 255}.
-
-    ETCI flood labels are RGB images whose channels agree and whose pixel
-    values live in {0, 1, 255}. Any deviation is treated as a corrupt label.
-    """
+def load_binary_mask(path: Path, label_name: str = "mask") -> Image.Image:
+    """Return a canonical mode-L binary mask with values in {0, 255}."""
     with Image.open(path) as image:
         array = np.asarray(image)
 
     if array.ndim == 3:
         if array.shape[2] != 3:
-            raise ValueError(f"unsupported flood mask channel count: {array.shape}")
+            raise ValueError(
+                f"unsupported {label_name} channel count: {array.shape}"
+            )
         if not (
             np.array_equal(array[..., 0], array[..., 1])
             and np.array_equal(array[..., 0], array[..., 2])
         ):
-            raise ValueError("flood mask channels differ")
+            raise ValueError(f"{label_name} channels differ")
         gray = array[..., 0]
     elif array.ndim == 2:
         gray = array
     else:
-        raise ValueError(f"unsupported flood mask shape: {array.shape}")
+        raise ValueError(f"unsupported {label_name} shape: {array.shape}")
 
-    if not set(np.unique(gray).tolist()).issubset(_ALLOWED_FLOOD_VALUES):
-        raise ValueError("non-binary flood mask values")
+    if not set(np.unique(gray).tolist()).issubset(_ALLOWED_MASK_VALUES):
+        raise ValueError(f"non-binary {label_name} values")
 
     binary = np.where(gray > 0, 255, 0).astype(np.uint8)
     return Image.fromarray(binary, mode="L")
+
+
+def load_binary_flood_mask(path: Path) -> Image.Image:
+    return load_binary_mask(path, "flood mask")
+
+
+def load_binary_water_mask(path: Path) -> Image.Image:
+    return load_binary_mask(path, "water-body mask")
+
+
+def compose_full_water_mask(water_path: Path, flood_path: Path) -> Image.Image:
+    water = load_binary_water_mask(water_path)
+    flood = load_binary_flood_mask(flood_path)
+    if water.size != flood.size:
+        raise ValueError(
+            f"water/flood mask size mismatch: water={water.size}, flood={flood.size}"
+        )
+    combined = np.asarray(water) > 0
+    combined |= np.asarray(flood) > 0
+    return Image.fromarray((combined.astype(np.uint8) * 255), mode="L")
 
 
 @lru_cache(maxsize=None)
@@ -157,8 +191,22 @@ def count_flood_pixels(path: Path) -> int:
     return int((np.asarray(mask) > 0).sum())
 
 
+@lru_cache(maxsize=None)
+def count_water_body_pixels(path: Path) -> int:
+    mask = load_binary_water_mask(path)
+    return int((np.asarray(mask) > 0).sum())
+
+
+@lru_cache(maxsize=None)
+def count_full_water_pixels(water_path: Path, flood_path: Path) -> int:
+    mask = compose_full_water_mask(water_path, flood_path)
+    return int((np.asarray(mask) > 0).sum())
+
+
 def clear_flood_pixel_cache() -> None:
     count_flood_pixels.cache_clear()
+    count_water_body_pixels.cache_clear()
+    count_full_water_pixels.cache_clear()
 
 
 def vv_passes_qc(
@@ -244,6 +292,31 @@ def build_temporal_pairs(
                 # A single corrupt post-event mask must not abort the whole job.
                 skips.append(_skip("corrupt_flood_label", post, str(exc)))
                 continue
+            try:
+                post_water_body_pixels = count_water_body_pixels(post.water_path)
+            except (OSError, ValueError) as exc:
+                skips.append(_skip("corrupt_water_label", post, str(exc)))
+                continue
+            try:
+                post_shapes_match = _shapes_match(
+                    post.vv_path,
+                    post.flood_path,
+                    post.water_path,
+                )
+            except (OSError, ValueError) as exc:
+                skips.append(_skip("label_shape_check_failed", post, str(exc)))
+                continue
+            if not post_shapes_match:
+                skips.append(_skip("label_shape_mismatch", post))
+                continue
+            try:
+                post_full_water_pixels = count_full_water_pixels(
+                    post.water_path,
+                    post.flood_path,
+                )
+            except (OSError, ValueError) as exc:
+                skips.append(_skip("corrupt_water_label", post, str(exc)))
+                continue
             if post_flood_pixels == 0 and not keep_negative_post:
                 skips.append(_skip("negative_post", post))
                 continue
@@ -264,8 +337,17 @@ def build_temporal_pairs(
                             continue
                         if count_flood_pixels(pre.flood_path) != 0:
                             continue
-                        if not _shapes_match(pre.vv_path, post.vv_path, post.flood_path):
+                        count_water_body_pixels(pre.water_path)
+                        if not _shapes_match(
+                            pre.vv_path,
+                            pre.flood_path,
+                            pre.water_path,
+                            post.vv_path,
+                            post.flood_path,
+                            post.water_path,
+                        ):
                             continue
+                        count_full_water_pixels(pre.water_path, pre.flood_path)
                     except (OSError, ValueError):
                         continue
                     chosen = pre
@@ -279,9 +361,19 @@ def build_temporal_pairs(
                         pre_ok, _ = vv_passes_qc(
                             pre.vv_path, min_vv_bytes, max_saturated_fraction
                         )
+                        if pre_ok:
+                            count_flood_pixels(pre.flood_path)
+                            count_water_body_pixels(pre.water_path)
                         shapes_ok = pre_ok and _shapes_match(
-                            pre.vv_path, post.vv_path, post.flood_path
+                            pre.vv_path,
+                            pre.flood_path,
+                            pre.water_path,
+                            post.vv_path,
+                            post.flood_path,
+                            post.water_path,
                         )
+                        if shapes_ok:
+                            count_full_water_pixels(pre.water_path, pre.flood_path)
                     except (OSError, ValueError):
                         shapes_ok = False
                     if shapes_ok:
@@ -306,8 +398,17 @@ def build_temporal_pairs(
                     post_vv_path=post.vv_path,
                     pre_flood_path=chosen.flood_path,
                     post_flood_path=post.flood_path,
+                    pre_water_path=chosen.water_path,
+                    post_water_path=post.water_path,
                     pre_flood_pixels=count_flood_pixels(chosen.flood_path),
                     post_flood_pixels=post_flood_pixels,
+                    pre_water_body_pixels=count_water_body_pixels(chosen.water_path),
+                    post_water_body_pixels=post_water_body_pixels,
+                    water_gt_a_pixels=count_full_water_pixels(
+                        chosen.water_path,
+                        chosen.flood_path,
+                    ),
+                    water_gt_b_pixels=post_full_water_pixels,
                     gap_days=(post.timestamp - chosen.timestamp).days,
                     policy=applied_policy,
                 )
@@ -364,23 +465,30 @@ def finalize_assignments(assigned):
     return assigned
 
 
-def _is_safe_tile_file(entry: Path, data_root: Path) -> bool:
-    """Reject symlinks and non-regular files; require resolution under data_root.
-
-    A compromised or hand-built source tree could plant tile symlinks pointing
-    at arbitrary host files. Hardlink/copy/symlink materialization would then
-    publish that content into the dataset, so indexing refuses such entries.
-    """
-    if entry.is_symlink() or not entry.is_file():
+def _is_safe_tile_file(
+    entry: Path,
+    data_root: Path,
+    trusted_symlink_root: Optional[Path] = None,
+) -> bool:
+    """Accept regular files and explicitly trusted Hub-cache symlinks only."""
+    if not entry.is_file():
         return False
+    if entry.is_symlink() and trusted_symlink_root is None:
+        return False
+
+    allowed_root = trusted_symlink_root if entry.is_symlink() else data_root
     try:
-        entry.resolve().relative_to(data_root.resolve())
+        entry.resolve(strict=True).relative_to(allowed_root.resolve(strict=True))
     except (OSError, ValueError):
         return False
     return True
 
 
-def index_labeled_split(data_root: Path, source_split: str):
+def index_labeled_split(
+    data_root: Path,
+    source_split: str,
+    trusted_symlink_root: Optional[Path] = None,
+):
     split_dir = data_root / source_split
     observations = []
     skips = []
@@ -401,15 +509,28 @@ def index_labeled_split(data_root: Path, source_split: str):
 
         vv_dir = scene_dir / "tiles" / "vv"
         flood_dir = scene_dir / "tiles" / "flood_label"
-        if not vv_dir.is_dir() or not flood_dir.is_dir():
-            skips.append({"reason": "missing_tile_dirs", "scene": scene_dir.name})
+        water_dir = scene_dir / "tiles" / "water_body_label"
+        missing_dirs = [
+            directory.name
+            for directory in (vv_dir, flood_dir, water_dir)
+            if not directory.is_dir()
+        ]
+        if missing_dirs:
+            skips.append(
+                {
+                    "reason": "missing_tile_dirs",
+                    "scene": scene_dir.name,
+                    "detail": ",".join(missing_dirs),
+                }
+            )
             continue
 
         vv_map = {}
+        ambiguous_vv_keys = set()
         for entry in sorted(vv_dir.iterdir()):
             if entry.name.startswith(".") or ".ipynb_checkpoints" in entry.parts:
                 continue
-            if not _is_safe_tile_file(entry, data_root):
+            if not _is_safe_tile_file(entry, data_root, trusted_symlink_root):
                 skips.append(
                     {"reason": "unsafe_tile_file", "scene": scene_dir.name, "file": entry.name}
                 )
@@ -428,19 +549,23 @@ def index_labeled_split(data_root: Path, source_split: str):
                     {"reason": "scene_filename_mismatch", "scene": scene_dir.name, "file": entry.name}
                 )
                 continue
-            if (x, y) in vv_map:
+            key = (x, y)
+            stats.vv_files += 1
+            if key in ambiguous_vv_keys or key in vv_map:
+                vv_map.pop(key, None)
+                ambiguous_vv_keys.add(key)
                 skips.append(
                     {"reason": "duplicate_vv_key", "scene": scene_dir.name, "x": x, "y": y}
                 )
                 continue
-            vv_map[(x, y)] = entry
-            stats.vv_files += 1
+            vv_map[key] = entry
 
         flood_map = {}
+        ambiguous_flood_keys = set()
         for entry in sorted(flood_dir.iterdir()):
             if entry.name.startswith(".") or ".ipynb_checkpoints" in entry.parts:
                 continue
-            if not _is_safe_tile_file(entry, data_root):
+            if not _is_safe_tile_file(entry, data_root, trusted_symlink_root):
                 skips.append(
                     {"reason": "unsafe_tile_file", "scene": scene_dir.name, "file": entry.name}
                 )
@@ -465,24 +590,101 @@ def index_labeled_split(data_root: Path, source_split: str):
                     {"reason": "scene_filename_mismatch", "scene": scene_dir.name, "file": entry.name}
                 )
                 continue
-            if (x, y) in flood_map:
+            key = (x, y)
+            stats.flood_files += 1
+            if key in ambiguous_flood_keys or key in flood_map:
+                flood_map.pop(key, None)
+                ambiguous_flood_keys.add(key)
                 skips.append(
                     {"reason": "duplicate_flood_alias", "scene": scene_dir.name, "x": x, "y": y}
                 )
                 continue
-            flood_map[(x, y)] = entry
-            stats.flood_files += 1
+            flood_map[key] = entry
 
-        for (x, y) in sorted(vv_map.keys() - flood_map.keys()):
+        water_map = {}
+        ambiguous_water_keys = set()
+        for entry in sorted(water_dir.iterdir()):
+            if entry.name.startswith(".") or ".ipynb_checkpoints" in entry.parts:
+                continue
+            if not _is_safe_tile_file(entry, data_root, trusted_symlink_root):
+                skips.append(
+                    {
+                        "reason": "unsafe_tile_file",
+                        "scene": scene_dir.name,
+                        "file": entry.name,
+                    }
+                )
+                continue
+            if entry.suffix.lower() != ".png":
+                continue
+            try:
+                parsed_water = parse_water_filename(entry.name)
+            except ValueError:
+                skips.append(
+                    {
+                        "reason": "vh_water_label",
+                        "scene": scene_dir.name,
+                        "file": entry.name,
+                    }
+                )
+                continue
+            if parsed_water is None:
+                skips.append(
+                    {
+                        "reason": "unparseable_water_name",
+                        "scene": scene_dir.name,
+                        "file": entry.name,
+                    }
+                )
+                continue
+            file_scene, x, y = parsed_water
+            if file_scene != scene_dir.name:
+                skips.append(
+                    {
+                        "reason": "scene_filename_mismatch",
+                        "scene": scene_dir.name,
+                        "file": entry.name,
+                    }
+                )
+                continue
+            key = (x, y)
+            stats.water_files += 1
+            if key in ambiguous_water_keys or key in water_map:
+                water_map.pop(key, None)
+                ambiguous_water_keys.add(key)
+                skips.append(
+                    {
+                        "reason": "duplicate_water_alias",
+                        "scene": scene_dir.name,
+                        "x": x,
+                        "y": y,
+                    }
+                )
+                continue
+            water_map[key] = entry
+
+        vv_keys = vv_map.keys() | ambiguous_vv_keys
+        flood_keys = flood_map.keys() | ambiguous_flood_keys
+        water_keys = water_map.keys() | ambiguous_water_keys
+        for (x, y) in sorted(vv_keys - flood_keys):
             skips.append(
                 {"reason": "vv_without_flood", "scene": scene_dir.name, "x": x, "y": y}
             )
-        for (x, y) in sorted(flood_map.keys() - vv_map.keys()):
+        for (x, y) in sorted(flood_keys - vv_keys):
             skips.append(
                 {"reason": "flood_without_vv", "scene": scene_dir.name, "x": x, "y": y}
             )
+        for (x, y) in sorted(vv_keys - water_keys):
+            skips.append(
+                {"reason": "vv_without_water", "scene": scene_dir.name, "x": x, "y": y}
+            )
+        for (x, y) in sorted(water_keys - vv_keys):
+            skips.append(
+                {"reason": "water_without_vv", "scene": scene_dir.name, "x": x, "y": y}
+            )
 
-        for (x, y) in sorted(vv_map.keys() & flood_map.keys()):
+        valid_keys = vv_map.keys() & flood_map.keys() & water_map.keys()
+        for (x, y) in sorted(valid_keys):
             observations.append(
                 TileObservation(
                     source_split=source_split,
@@ -493,6 +695,7 @@ def index_labeled_split(data_root: Path, source_split: str):
                     y=y,
                     vv_path=vv_map[(x, y)],
                     flood_path=flood_map[(x, y)],
+                    water_path=water_map[(x, y)],
                 )
             )
 
@@ -507,6 +710,7 @@ def inspect_test_internal(data_root: Path) -> dict:
         "scenes": 0,
         "vv_files": 0,
         "flood_label_files": 0,
+        "water_body_label_files": 0,
         "excluded_reason": None,
     }
     if not internal.is_dir():
@@ -519,6 +723,9 @@ def inspect_test_internal(data_root: Path) -> dict:
     )
     info["flood_label_files"] = sum(
         1 for path in internal.rglob("tiles/flood_label/*.png") if path.is_file()
+    )
+    info["water_body_label_files"] = sum(
+        1 for path in internal.rglob("tiles/water_body_label/*.png") if path.is_file()
     )
     if info["flood_label_files"] == 0:
         info["excluded_reason"] = "no_flood_label"
