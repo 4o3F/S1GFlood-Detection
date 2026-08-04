@@ -178,6 +178,21 @@ class TemporalLogicTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mask transform differs"):
                 discover_mask_refs(source)
 
+    def test_pair_variants_preserve_water_roles_and_chronology(self):
+        variants = {variant.name: variant for variant in PAIR_VARIANTS}
+        before = variants["before_to_peak"]
+        self.assertEqual(before.a_role, "before")
+        self.assertEqual(before.b_role, "peak")
+        self.assertEqual(before.gt_baseline_role, "before")
+        self.assertTrue(before.chronological)
+
+        after = variants["after_to_peak"]
+        self.assertEqual(after.a_role, "after")
+        self.assertEqual(after.b_role, "peak")
+        self.assertEqual(after.gt_baseline_role, "after")
+        self.assertFalse(after.chronological)
+        self.assertTrue(all(variant.b_role == "peak" for variant in PAIR_VARIANTS))
+
     def test_semantic_filename(self):
         self.assertEqual(
             build_filename(TileKey(3, 12), PAIR_VARIANTS[0]),
@@ -205,6 +220,11 @@ class ConverterIntegrationTest(unittest.TestCase):
         peak_water[256:384, 256:384] = True
         before_water[256:320, 256:320] = True
         after_water[320:384, 320:384] = True
+        self.water_masks = {
+            "before": before_water,
+            "peak": peak_water,
+            "after": after_water,
+        }
 
         write_mask(
             self.source / "nested" / "1_water_before_20240402.png",
@@ -412,6 +432,18 @@ class ConverterIntegrationTest(unittest.TestCase):
             split_rows = list(csv.DictReader(handle))
         self.assertEqual(len(pair_rows), 16)
         self.assertEqual(len(split_rows), len(pair_rows))
+        self.assertTrue(
+            all(
+                row["water_gt_formula"] == converter.WATER_GT_FORMULA
+                for row in pair_rows
+            )
+        )
+        self.assertTrue(
+            all("water_gt_a_pixels" in row for row in pair_rows)
+        )
+        self.assertTrue(
+            all("water_gt_b_pixels" in row for row in pair_rows)
+        )
 
         invalid_names = {
             "kulsary_r0000_c0000_before_to_peak.png",
@@ -439,25 +471,43 @@ class ConverterIntegrationTest(unittest.TestCase):
             )
 
         for split_name in ("train", "val", "test"):
-            names = []
-            for subdirectory in ("A", "B", "GT"):
-                directory = self.output / split_name / subdirectory
-                names.append({path.name for path in directory.glob("*.png")})
-            self.assertEqual(names[0], names[1])
-            self.assertEqual(names[0], names[2])
-            self.assertTrue(names[0])
-            for filename in names[0]:
-                with Image.open(self.output / split_name / "A" / filename) as image:
-                    self.assertEqual(image.mode, "RGB")
-                    self.assertEqual(image.size, (256, 256))
-                with Image.open(self.output / split_name / "GT" / filename) as image:
-                    self.assertEqual(image.mode, "L")
-                    self.assertTrue(set(image.getdata()).issubset({0, 255}))
+            names = {
+                subdirectory: {
+                    path.name
+                    for path in (
+                        self.output / split_name / subdirectory
+                    ).glob("*.png")
+                }
+                for subdirectory in converter.OUTPUT_SUBDIRS
+            }
+            reference_names = names["A"]
+            self.assertTrue(reference_names)
+            self.assertTrue(
+                all(value == reference_names for value in names.values())
+            )
+            for filename in reference_names:
+                for subdirectory in ("A", "B"):
+                    with Image.open(
+                        self.output / split_name / subdirectory / filename
+                    ) as image:
+                        self.assertEqual(image.mode, "RGB")
+                        self.assertEqual(image.size, (256, 256))
+                for subdirectory in converter.MASK_SUBDIRS:
+                    with Image.open(
+                        self.output / split_name / subdirectory / filename
+                    ) as image:
+                        self.assertEqual(image.mode, "L")
+                        self.assertEqual(image.size, (256, 256))
+                        self.assertTrue(
+                            set(image.getdata()).issubset({0, 255})
+                        )
 
         before_row = next(
             row
             for row in pair_rows
-            if row["variant"] == "before_to_peak" and row["tile_row"] != "0"
+            if row["variant"] == "before_to_peak"
+            and row["tile_row"] == "1"
+            and row["tile_col"] == "1"
         )
         matching_after = next(
             row
@@ -498,29 +548,153 @@ class ConverterIntegrationTest(unittest.TestCase):
                 / matching_after["filename"]
             )
         )
+
+        def read_output_mask(row, subdirectory):
+            path = (
+                self.output
+                / row["split"]
+                / subdirectory
+                / row["filename"]
+            )
+            with Image.open(path) as image:
+                return np.asarray(image).copy()
+
+        tile_slice = np.s_[256:512, 256:512]
+        expected_before = np.where(
+            self.water_masks["before"][tile_slice],
+            255,
+            0,
+        ).astype(np.uint8)
+        expected_peak = np.where(
+            self.water_masks["peak"][tile_slice],
+            255,
+            0,
+        ).astype(np.uint8)
+        expected_after = np.where(
+            self.water_masks["after"][tile_slice],
+            255,
+            0,
+        ).astype(np.uint8)
+        expected_before_gt = np.where(
+            compose_flood_mask(
+                self.water_masks["peak"][tile_slice],
+                self.water_masks["before"][tile_slice],
+            ),
+            255,
+            0,
+        ).astype(np.uint8)
+        expected_after_gt = np.where(
+            compose_flood_mask(
+                self.water_masks["peak"][tile_slice],
+                self.water_masks["after"][tile_slice],
+            ),
+            255,
+            0,
+        ).astype(np.uint8)
+
+        before_water_a = read_output_mask(before_row, "WATER_GT_A")
+        before_water_b = read_output_mask(before_row, "WATER_GT_B")
+        after_water_a = read_output_mask(matching_after, "WATER_GT_A")
+        after_water_b = read_output_mask(matching_after, "WATER_GT_B")
+        np.testing.assert_array_equal(before_water_a, expected_before)
+        np.testing.assert_array_equal(before_water_b, expected_peak)
+        np.testing.assert_array_equal(after_water_a, expected_after)
+        np.testing.assert_array_equal(after_water_b, expected_peak)
+        np.testing.assert_array_equal(before_water_b, after_water_b)
+        np.testing.assert_array_equal(
+            read_output_mask(before_row, "GT"),
+            expected_before_gt,
+        )
+        np.testing.assert_array_equal(
+            read_output_mask(matching_after, "GT"),
+            expected_after_gt,
+        )
+        self.assertEqual(
+            int(before_row["water_gt_a_pixels"]),
+            int((before_water_a > 0).sum()),
+        )
+        self.assertEqual(
+            int(before_row["water_gt_b_pixels"]),
+            int((before_water_b > 0).sum()),
+        )
+        self.assertEqual(
+            int(matching_after["water_gt_a_pixels"]),
+            int((after_water_a > 0).sum()),
+        )
+        self.assertEqual(
+            int(matching_after["water_gt_b_pixels"]),
+            int((after_water_b > 0).sum()),
+        )
+
         self.assertLess(float(before_a.mean()), float(after_a.mean()))
         np.testing.assert_array_equal(before_b, after_b)
 
+        expected_water_pixels = {
+            split_name: {
+                "water_gt_a": sum(
+                    int(row["water_gt_a_pixels"])
+                    for row in pair_rows
+                    if row["split"] == split_name
+                ),
+                "water_gt_b": sum(
+                    int(row["water_gt_b_pixels"])
+                    for row in pair_rows
+                    if row["split"] == split_name
+                ),
+            }
+            for split_name in ("train", "val", "test")
+        }
         metadata = json.loads(
             (self.output / "split_metadata.json").read_text(encoding="utf-8")
         )
         self.assertEqual(metadata["mode"], "render")
+        self.assertEqual(metadata["converter_version"], "1.1.0")
         self.assertEqual(metadata["counts"], result["counts"])
+        self.assertEqual(
+            metadata["output_subdirectories"],
+            list(converter.OUTPUT_SUBDIRS),
+        )
+        self.assertEqual(metadata["water_supervision"], "dense")
+        self.assertEqual(metadata["water_gt_formula"], converter.WATER_GT_FORMULA)
+        self.assertEqual(metadata["water_supervised_counts"], result["counts"])
+        self.assertEqual(
+            metadata["water_pixels_per_output_split"],
+            expected_water_pixels,
+        )
 
         qc = json.loads(
             (self.output / "qc_report.json").read_text(encoding="utf-8")
         )
         self.assertEqual(qc["tiles"]["kept_tiles"], 8)
         self.assertEqual(qc["tiles"]["invalid_tiles"], 1)
+        self.assertEqual(qc["water_supervision"], "dense")
+        self.assertEqual(qc["water_gt_formula"], converter.WATER_GT_FORMULA)
+        self.assertEqual(
+            qc["water_supervised_pairs_per_output_split"],
+            result["counts"],
+        )
+        self.assertEqual(
+            qc["water_pixels_per_output_split"],
+            expected_water_pixels,
+        )
 
         from utils.dataloaders import FloodDetection, train_path
 
         train_full, _ = train_path(str(self.output) + os.sep)
-        dataset = FloodDetection(train_full, aug=False)
-        image_a, image_b, gt, name = dataset[0]
+        dataset = FloodDetection(
+            train_full,
+            aug=False,
+            include_water=True,
+        )
+        image_a, image_b, targets, name = dataset[0]
         self.assertEqual(tuple(image_a.shape), (3, 256, 256))
         self.assertEqual(tuple(image_b.shape), (3, 256, 256))
-        self.assertEqual(tuple(gt.shape), (256, 256))
+        self.assertTrue(targets["water_valid"].item())
+        for target_name in ("change", "water_a", "water_b"):
+            self.assertEqual(tuple(targets[target_name].shape), (256, 256))
+            self.assertTrue(
+                set(np.unique(targets[target_name].numpy())).issubset({0.0, 1.0})
+            )
         self.assertTrue(name.startswith("kulsary_"))
 
     def test_work_and_cache_cannot_overlap_reserved_output_paths(self):

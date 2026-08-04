@@ -55,7 +55,14 @@ from utils.kulsary_temporal import (
 )
 
 
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
+OUTPUT_SUBDIRS = ("A", "B", "GT", "WATER_GT_A", "WATER_GT_B")
+MASK_SUBDIRS = ("GT", "WATER_GT_A", "WATER_GT_B")
+GT_SEMANTICS = "peak_water AND NOT variant baseline water"
+WATER_GT_FORMULA = (
+    "WATER_GT_A = full water[a_role]; WATER_GT_B = full water[b_role]"
+)
+MASK_ENCODING = "single-channel PNG mode L with values {0,255}"
 DEFAULT_SAFE_ROOT = Path("/home/ubuntu/lhx/Sentinel1-SAR/restored_grd")
 DEFAULT_WORK_DIR = Path.home() / "scratch" / "damnet-safe"
 DEFAULT_GRAPH = Path(__file__).resolve().parent / "snap" / "s1_grd_preprocess.xml"
@@ -82,6 +89,9 @@ PAIR_MANIFEST_COLUMNS = (
     "a_safe_id",
     "b_safe_id",
     "gt_formula",
+    "water_gt_a_pixels",
+    "water_gt_b_pixels",
+    "water_gt_formula",
     "gt_positive_pixels",
     "gt_fraction",
     "valid_fraction",
@@ -546,7 +556,8 @@ def _print_static_summary(
         print(
             f"  {variant.name}: A={ROLE_DATES[variant.a_role]} "
             f"B={ROLE_DATES[variant.b_role]} GT={variant.gt_formula} "
-            f"[{chronology}]"
+            f"WATER_GT_A={variant.a_role}_water "
+            f"WATER_GT_B={variant.b_role}_water [{chronology}]"
         )
     print("SNAP cache probe:")
     for role in ROLE_DATES:
@@ -576,30 +587,15 @@ def _warp_masks(mask_refs: dict[str, MaskRef], grid: CommonGrid):
         dtype=np.uint8,
     )
     coverage = _reproject_mask(coverage_source, peak_ref, grid)
-
-    peak = _reproject_mask(
-        load_binary_water_mask(peak_ref.png_path),
-        peak_ref,
-        grid,
-    )
-    before = _reproject_mask(
-        load_binary_water_mask(mask_refs["before"].png_path),
-        mask_refs["before"],
-        grid,
-    )
-    before_to_peak = compose_flood_mask(peak, before)
-    del before
-
-    after = _reproject_mask(
-        load_binary_water_mask(mask_refs["after"].png_path),
-        mask_refs["after"],
-        grid,
-    )
-    after_to_peak = compose_flood_mask(peak, after)
-    return {
-        "before_to_peak": before_to_peak,
-        "after_to_peak": after_to_peak,
-    }, coverage
+    water_masks = {
+        role: _reproject_mask(
+            load_binary_water_mask(mask_refs[role].png_path),
+            mask_refs[role],
+            grid,
+        )
+        for role in ROLE_DATES
+    }
+    return water_masks, coverage
 
 
 def _tile_slice(tile: TileKey):
@@ -672,7 +668,7 @@ def _plan_tiles(
 
 def _ensure_split_dirs(staging_root: Path) -> None:
     for split_name in OUTPUT_SPLITS:
-        for subdirectory in ("A", "B", "GT"):
+        for subdirectory in OUTPUT_SUBDIRS:
             (staging_root / split_name / subdirectory).mkdir(
                 parents=True,
                 exist_ok=True,
@@ -697,6 +693,10 @@ def _to_rgb(
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
+def _to_mask_u8(mask: np.ndarray) -> np.ndarray:
+    return np.where(mask, 255, 0).astype(np.uint8)
+
+
 def _pair_id(filename: str) -> str:
     return hashlib.sha1(filename.encode("utf-8")).hexdigest()[:12]
 
@@ -705,7 +705,7 @@ def _write_tiles(
     staging_root: Path,
     stack: Sigma0Stack,
     assigned: list[AssignedPair],
-    flood_masks: dict[str, np.ndarray],
+    water_masks: dict[str, np.ndarray],
     products,
     args: argparse.Namespace,
 ):
@@ -715,7 +715,7 @@ def _write_tiles(
 
     records = []
     with tqdm(
-        total=len(assigned) * 3,
+        total=len(assigned) * len(OUTPUT_SUBDIRS),
         unit="file",
         desc="Rendering Kulsary pairs",
     ) as progress:
@@ -746,8 +746,13 @@ def _write_tiles(
                 key=lambda value: value.variant.name,
             ):
                 variant = item.variant
-                gt = flood_masks[variant.name][_tile_slice(tile)]
-                gt_u8 = np.where(gt, 255, 0).astype(np.uint8)
+                tile_slice = _tile_slice(tile)
+                water_a = water_masks[variant.a_role][tile_slice]
+                water_b = water_masks[variant.b_role][tile_slice]
+                gt = compose_flood_mask(
+                    water_masks["peak"][tile_slice],
+                    water_masks[variant.gt_baseline_role][tile_slice],
+                )
                 split_root = staging_root / item.output_split
 
                 Image.fromarray(rgb[variant.a_role]).save(
@@ -760,8 +765,18 @@ def _write_tiles(
                     format="PNG",
                 )
                 progress.update(1)
-                Image.fromarray(gt_u8).save(
+                Image.fromarray(_to_mask_u8(gt), mode="L").save(
                     split_root / "GT" / item.filename,
+                    format="PNG",
+                )
+                progress.update(1)
+                Image.fromarray(_to_mask_u8(water_a), mode="L").save(
+                    split_root / "WATER_GT_A" / item.filename,
+                    format="PNG",
+                )
+                progress.update(1)
+                Image.fromarray(_to_mask_u8(water_b), mode="L").save(
+                    split_root / "WATER_GT_B" / item.filename,
                     format="PNG",
                 )
                 progress.update(1)
@@ -789,6 +804,9 @@ def _write_tiles(
                         "a_safe_id": products[variant.a_role].identifier,
                         "b_safe_id": products[variant.b_role].identifier,
                         "gt_formula": variant.gt_formula,
+                        "water_gt_a_pixels": int(water_a.sum()),
+                        "water_gt_b_pixels": int(water_b.sum()),
+                        "water_gt_formula": WATER_GT_FORMULA,
                         "gt_positive_pixels": positive,
                         "gt_fraction": positive / float(PATCH_SIZE * PATCH_SIZE),
                         "valid_fraction": 1.0,
@@ -857,6 +875,23 @@ def _build_qc_report(
             ),
         }
 
+    water_supervised_counts = _split_counts(assigned)
+    water_pixels_per_split = {
+        split_name: {
+            "water_gt_a": sum(
+                int(record["water_gt_a_pixels"])
+                for record in records
+                if record["split"] == split_name
+            ),
+            "water_gt_b": sum(
+                int(record["water_gt_b_pixels"])
+                for record in records
+                if record["split"] == split_name
+            ),
+        }
+        for split_name in OUTPUT_SPLITS
+    }
+
     block_splits = {}
     for item in assigned:
         block = spatial_block_key(item.tile, args.block_tiles)
@@ -878,6 +913,13 @@ def _build_qc_report(
             role: ref.positive_pixels for role, ref in mask_refs.items()
         },
         "source_grid_gt_positive_pixels": source_gt_counts,
+        "output_subdirectories": list(OUTPUT_SUBDIRS),
+        "gt_semantics": GT_SEMANTICS,
+        "water_supervision": "dense",
+        "water_gt_formula": WATER_GT_FORMULA,
+        "water_supervised_pairs_per_output_split": water_supervised_counts,
+        "water_pixels_per_output_split": water_pixels_per_split,
+        "mask_encoding": MASK_ENCODING,
         "snap": {
             "requested_target_crs": args.target_crs,
             "actual_crs": stack.grid.crs.to_string(),
@@ -984,6 +1026,17 @@ def _write_artifacts(
         ),
         "converter": "prepare_kulsary_pairs.py",
         "converter_version": CONVERTER_VERSION,
+        "output_subdirectories": list(OUTPUT_SUBDIRS),
+        "gt_semantics": GT_SEMANTICS,
+        "water_supervision": "dense",
+        "water_gt_formula": WATER_GT_FORMULA,
+        "mask_encoding": MASK_ENCODING,
+        "water_supervised_counts": qc_report[
+            "water_supervised_pairs_per_output_split"
+        ],
+        "water_pixels_per_output_split": qc_report[
+            "water_pixels_per_output_split"
+        ],
     }
     (staging_root / "split_metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n",
@@ -1012,27 +1065,47 @@ def _write_artifacts(
     )
 
 
+def _verify_output_mask(path: Path) -> None:
+    with Image.open(path) as image:
+        array = np.asarray(image)
+        if image.mode != "L" or image.size != (PATCH_SIZE, PATCH_SIZE):
+            raise RuntimeError(f"invalid output mask contract: {path}")
+        if array.dtype != np.uint8:
+            raise RuntimeError(f"invalid output mask dtype: {path}")
+        if not set(np.unique(array).tolist()).issubset({0, 255}):
+            raise RuntimeError(f"non-binary output mask values: {path}")
+
+
 def _verify_tree(root: Path) -> None:
     for split_name in OUTPUT_SPLITS:
         split_root = root / split_name
-        names = []
-        for subdirectory in ("A", "B", "GT"):
+        names_by_subdirectory = {}
+        for subdirectory in OUTPUT_SUBDIRS:
             directory = split_root / subdirectory
             if not directory.is_dir():
                 raise RuntimeError(f"missing output directory: {directory}")
-            names.append(
-                {
-                    path.name
-                    for path in directory.iterdir()
-                    if path.is_file() and path.suffix.lower() == ".png"
-                }
-            )
-        if not names[0]:
-            raise RuntimeError(f"output split is empty: {split_name}")
-        if names[0] != names[1] or names[0] != names[2]:
-            raise RuntimeError(f"A/B/GT basename mismatch in split {split_name}")
+            names_by_subdirectory[subdirectory] = {
+                path.name
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() == ".png"
+            }
 
-        for filename in sorted(names[0]):
+        reference_names = names_by_subdirectory["A"]
+        if not reference_names:
+            raise RuntimeError(f"output split is empty: {split_name}")
+        if any(
+            names != reference_names
+            for names in names_by_subdirectory.values()
+        ):
+            counts = {
+                name: len(names)
+                for name, names in names_by_subdirectory.items()
+            }
+            raise RuntimeError(
+                f"prepared basename mismatch in split {split_name}: {counts}"
+            )
+
+        for filename in sorted(reference_names):
             for subdirectory in ("A", "B"):
                 path = split_root / subdirectory / filename
                 with Image.open(path) as image:
@@ -1047,15 +1120,8 @@ def _verify_tree(root: Path) -> None:
                     ):
                         raise RuntimeError(f"A/B channels differ: {path}")
 
-            gt_path = split_root / "GT" / filename
-            with Image.open(gt_path) as image:
-                array = np.asarray(image)
-                if image.mode != "L" or image.size != (PATCH_SIZE, PATCH_SIZE):
-                    raise RuntimeError(f"invalid GT image contract: {gt_path}")
-                if array.dtype != np.uint8:
-                    raise RuntimeError(f"invalid GT dtype: {gt_path}")
-                if not set(np.unique(array).tolist()).issubset({0, 255}):
-                    raise RuntimeError(f"non-binary GT values: {gt_path}")
+            for subdirectory in MASK_SUBDIRS:
+                _verify_output_mask(split_root / subdirectory / filename)
 
 
 def _loader_smoke(root: Path) -> None:
@@ -1065,20 +1131,37 @@ def _loader_smoke(root: Path) -> None:
     train_full, val_full = train_path(data_dir)
     test_full = test_path(data_dir)
     datasets = {
-        "train": FloodDetection(train_full, aug=False),
-        "val": FloodDetection(val_full, aug=False),
-        "test": FloodDetection(test_full, aug=False),
+        "train": FloodDetection(
+            train_full,
+            aug=False,
+            include_water=True,
+        ),
+        "val": FloodDetection(
+            val_full,
+            aug=False,
+            include_water=True,
+        ),
+        "test": FloodDetection(
+            test_full,
+            aug=False,
+            include_water=True,
+        ),
     }
     for split_name, dataset in datasets.items():
         if len(dataset) == 0:
             raise RuntimeError(f"loader smoke found an empty split: {split_name}")
-        image_a, image_b, gt, _ = dataset[0]
+        image_a, image_b, targets, _ = dataset[0]
         if tuple(image_a.shape) != (3, PATCH_SIZE, PATCH_SIZE):
             raise RuntimeError(f"loader returned an invalid A tensor for {split_name}")
         if tuple(image_b.shape) != (3, PATCH_SIZE, PATCH_SIZE):
             raise RuntimeError(f"loader returned an invalid B tensor for {split_name}")
-        if tuple(gt.shape) != (PATCH_SIZE, PATCH_SIZE):
-            raise RuntimeError(f"loader returned an invalid GT tensor for {split_name}")
+        if not targets["water_valid"].item():
+            raise RuntimeError(f"loader did not expose water labels for {split_name}")
+        for target_name in ("change", "water_a", "water_b"):
+            if tuple(targets[target_name].shape) != (PATCH_SIZE, PATCH_SIZE):
+                raise RuntimeError(
+                    f"loader returned an invalid {target_name} tensor for {split_name}"
+                )
 
 
 def _create_sigma0_rasters(
@@ -1189,7 +1272,7 @@ def prepare(args: argparse.Namespace) -> dict:
             gpt,
         )
         with Sigma0Stack(sigma0_paths, mask_refs["peak"]) as stack:
-            flood_masks, mask_coverage = _warp_masks(mask_refs, stack.grid)
+            water_masks, mask_coverage = _warp_masks(mask_refs, stack.grid)
             kept, assigned, skips = _plan_tiles(stack, mask_coverage, args)
             if not kept:
                 raise ValueError("no fully valid 256x256 Kulsary tiles were found")
@@ -1208,7 +1291,7 @@ def prepare(args: argparse.Namespace) -> dict:
                     staging,
                     stack,
                     assigned,
-                    flood_masks,
+                    water_masks,
                     products,
                     args,
                 )

@@ -253,14 +253,30 @@ uv run python train.py --dataset-dir /path/to/ETCI_2021_prepared
 ### Kulsary Orbit 159 temporal pairs
 
 `prepare_kulsary_pairs.py` converts the three Kulsary 2024 Sentinel-1
-acquisitions and their PNG+PGW water masks into the same
-`{train,val,test}/{A,B,GT}` contract. It creates two semantic variants at each
-valid tile coordinate:
+acquisitions and their PNG+PGW full-water masks into the same five-directory
+contract used by the training pipeline:
 
-| Variant | A (baseline) | B (flood peak) | GT | Chronology |
-|---|---|---|---|---|
-| `before_to_peak` | 2024-04-02 | 2024-04-14 | peak water excluding 04-02 water | chronological |
-| `after_to_peak` | 2024-04-26 | 2024-04-14 | peak water excluding 04-26 water | deliberately reversed |
+```text
+<split>/
+├── A/<name>.png
+├── B/<name>.png
+├── GT/<name>.png
+├── WATER_GT_A/<name>.png
+└── WATER_GT_B/<name>.png
+```
+
+It creates two semantic variants at each valid tile coordinate:
+
+| Variant | A (baseline) | B (flood peak) | GT | WATER_GT_A | WATER_GT_B | Chronology |
+|---|---|---|---|---|---|---|
+| `before_to_peak` | 2024-04-02 | 2024-04-14 | peak water excluding 04-02 water | 04-02 full water | 04-14 full water | chronological |
+| `after_to_peak` | 2024-04-26 | 2024-04-14 | peak water excluding 04-26 water | 04-26 full water | 04-14 full water | deliberately reversed |
+
+The Kulsary source masks already represent the complete water extent for each
+acquisition. Unlike ETCI, no `water_body_label OR flood_label` composition is
+needed. `GT`, `WATER_GT_A`, and `WATER_GT_B` are all written as canonical
+single-channel mode-L PNGs with values `{0,255}`, and every emitted Kulsary
+sample has paired water supervision.
 
 The converter requires three restored, standard GRD SAFE products under
 `--safe-root` or its managed `products/` directory. Products are assigned to
@@ -309,8 +325,9 @@ variants, while all-background GT tiles are retained.
 Unique 2×2-tile spatial super-blocks are deterministically assigned
 80/10/10 to train, validation, and test. Both variants at one coordinate
 always share a split. The output includes split, pair, QC, and skipped-record
-manifests and can be passed directly to `train.py` or merged with another
-prepared root:
+manifests; the pair/QC metadata records dense water supervision and per-split
+water-pixel totals. The prepared root can be passed directly to `train.py` or
+merged with another dataset:
 
 ```shell
 uv run python merge_datasets.py \
