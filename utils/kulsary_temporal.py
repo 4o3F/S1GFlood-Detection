@@ -20,6 +20,7 @@ ROLE_DATES = {
     "peak": date(2024, 4, 14),
     "after": date(2024, 4, 26),
 }
+ROLES = tuple(ROLE_DATES)
 MASK_PATTERNS = {
     "before": "*water_before_20240402*.png",
     "peak": "*water_during_20240414*.png",
@@ -92,6 +93,14 @@ class AssignedPair:
     output_split: str
     variant: PairVariant
     filename: str
+
+
+@dataclass(frozen=True)
+class AssignedRoleSample:
+    tile: TileKey
+    output_split: str
+    role: str
+    name: str
 
 
 def parse_world_file(path: Path) -> WorldFile:
@@ -315,6 +324,46 @@ def assign_spatial_blocks(
 
 def build_filename(tile: TileKey, variant: PairVariant) -> str:
     return f"kulsary_r{tile.row:04d}_c{tile.col:04d}_{variant.name}.png"
+
+
+def build_role_name(tile: TileKey, role: str) -> str:
+    if role not in ROLES:
+        raise ValueError(f"unsupported Kulsary role: {role}")
+    return f"kulsary_r{tile.row:04d}_c{tile.col:04d}#{role}"
+
+
+def expand_role_samples(
+    tiles: Iterable[TileKey],
+    split_by_tile: dict[TileKey, str],
+) -> list[AssignedRoleSample]:
+    assigned = []
+    for tile in sorted(set(tiles)):
+        try:
+            output_split = split_by_tile[tile]
+        except KeyError as exc:
+            raise ValueError(f"tile has no output split: {tile}") from exc
+        if output_split not in OUTPUT_SPLITS:
+            raise ValueError(f"unsupported output split: {output_split}")
+
+        for role in ROLES:
+            assigned.append(
+                AssignedRoleSample(
+                    tile=tile,
+                    output_split=output_split,
+                    role=role,
+                    name=build_role_name(tile, role),
+                )
+            )
+
+    split_order = {name: index for index, name in enumerate(OUTPUT_SPLITS)}
+    ordered = sorted(
+        assigned,
+        key=lambda item: (split_order[item.output_split], item.name),
+    )
+    names = [item.name for item in ordered]
+    if len(names) != len(set(names)):
+        raise ValueError("single-temporal Kulsary sample-name collision")
+    return ordered
 
 
 def expand_pair_variants(

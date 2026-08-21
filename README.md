@@ -409,27 +409,33 @@ You can download our novel public S1GFloods dataset through the following link:
     --water-loss-weight 0.2
   ```
 
-- Standalone single-temporal water segmentation
+- Standalone single-temporal Kulsary water segmentation
 
-  A separate VV-only Swin-T + U-Net baseline is available under
-  [`water_seg/`](water_seg/README.md). It flattens labeled A and B dates into
-  independent samples and trains only against complete-water
-  `WATER_GT_A/WATER_GT_B` masks; the flood-change `GT` mask is never reused as
-  water supervision.
+  The VV-only Swin-T + U-Net under [`water_seg/`](water_seg/README.md) uses a
+  two-stage workflow. First publish three stable linear-Sigma0 GeoTIFFs from
+  the restored standard GRD SAFE tree; then train directly from that Sigma0
+  root and the original PNG+PGW masks. Each valid tile contributes `before`,
+  `peak`, and `after` exactly once.
 
   ```shell
+  uv run python prepare_kulsary_sigma0.py \
+    --safe-root /home/ubuntu/lhx/Sentinel1-SAR/restored_grd \
+    --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+    --gpt /usr/local/esa-snap/bin/gpt
+
   uv run python -m water_seg.train \
-    --dataset-dir /path/to/merged
+    --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+    --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks
 
   uv run python -m water_seg.eval \
-    --dataset-dir /path/to/merged \
     --path .tmp/water_swin_tiny_unet/best.pth
   ```
 
-  This baseline follows the GEOID-Flood Swin-T/U-Net protocol where it is
-  compatible with the current data, while retaining this repository's VV-only
-  labels and mask semantics. See the module README for the benchmark numbers,
-  compatibility limits, and offline initialization option.
+  The preprocessing script collapses duplicate top-level/`products/` SAFE
+  copies by identifier, reuses the existing SNAP cache, and atomically writes
+  the canonical Sigma0 dataset. Training converts Sigma0 to clipped dB in
+  memory, computes normalization from the train split only, and never runs
+  SNAP in the DataLoader. See the module README for complete contracts.
 
 - Testing
 

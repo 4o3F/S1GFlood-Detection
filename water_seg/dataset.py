@@ -1,146 +1,518 @@
-import os
+from collections import Counter
+from dataclasses import dataclass
+import json
+import math
+from pathlib import Path
 import random
 
 import numpy as np
 import torch
 import torch.utils.data as data
-from PIL import Image
 
-from utils.dataloaders import _build_split_dataset, _open_binary_mask, _open_rgb
-
-
-_D4_OPS = (
-    None,
-    Image.ROTATE_90,
-    Image.ROTATE_180,
-    Image.ROTATE_270,
-    Image.FLIP_LEFT_RIGHT,
-    Image.FLIP_TOP_BOTTOM,
-    Image.TRANSPOSE,
-    Image.TRANSVERSE,
+from utils.kulsary_raster import (
+    PATCH_SIZE,
+    CommonGrid,
+    LazySigma0Stack,
+    Sigma0Stack,
+    linear_sigma0_to_clipped_db,
+    plan_valid_tiles,
+    sampled_file_fingerprint,
+    tile_slice,
+    tile_window,
+    warp_masks,
+)
+from utils.kulsary_temporal import (
+    OUTPUT_SPLITS,
+    ROLE_DATES,
+    AssignedRoleSample,
+    TileKey,
+    assign_spatial_blocks,
+    discover_mask_refs,
+    expand_role_samples,
 )
 
 
-def flatten_water_records(full_load):
-    if isinstance(full_load, dict):
-        source = (full_load[key] for key in sorted(full_load))
-    else:
-        source = full_load
-
-    records = []
-    for record in source:
-        water_labels = record.get('water_labels')
-        if not water_labels:
-            continue
-        directory, name = record['image']
-        water_a, water_b = water_labels
-        records.append({
-            'image': os.path.join(directory, 'A', name),
-            'mask': water_a,
-            'name': f'{name}#A',
-        })
-        records.append({
-            'image': os.path.join(directory, 'B', name),
-            'mask': water_b,
-            'name': f'{name}#B',
-        })
-
-    if not records:
-        raise FileNotFoundError(
-            'water dataset requires WATER_GT_A and WATER_GT_B labels; none remain'
-        )
-    return records
+_ROLE_ORDER = tuple(ROLE_DATES)
+_D4_IDENTITY = 0
+_D4_ROT90 = 1
+_D4_ROT180 = 2
+_D4_ROT270 = 3
+_D4_FLIP_LR = 4
+_D4_FLIP_UD = 5
+_D4_TRANSPOSE = 6
+_D4_TRANSVERSE = 7
+SIGMA0_ROOT_FILENAMES = {
+    'before': 'before_sigma0_vv.tif',
+    'peak': 'peak_sigma0_vv.tif',
+    'after': 'after_sigma0_vv.tif',
+}
+SIGMA0_MANIFEST_FILENAME = 'sigma0_manifest.json'
 
 
-def _as_single_channel_vv(image, path):
-    array = np.asarray(image)
-    if array.ndim != 3 or array.shape[2] != 3:
-        raise ValueError(f'expected RGB image for single-channel VV: {path}')
-    if not (
-        np.array_equal(array[..., 0], array[..., 1])
-        and np.array_equal(array[..., 0], array[..., 2])
-    ):
+def _require_path(path, *, kind, role=None):
+    resolved = Path(path).expanduser().resolve()
+    label = kind if role is None else f'{kind} for {role}'
+    if not resolved.is_file():
+        raise FileNotFoundError(f'{label} is missing: {resolved}')
+    return resolved
+
+
+def _require_directory(path, *, kind):
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f'{kind} is missing: {resolved}')
+    return resolved
+
+
+def resolve_sigma0_paths(
+    *,
+    sigma0_root=None,
+    sigma0_before=None,
+    sigma0_peak=None,
+    sigma0_after=None,
+):
+    explicit = {
+        'before': sigma0_before,
+        'peak': sigma0_peak,
+        'after': sigma0_after,
+    }
+    has_explicit = [value is not None for value in explicit.values()]
+    if sigma0_root is not None and any(has_explicit):
         raise ValueError(
-            f'RGB channels must be identical for single-channel VV: {path}'
+            '--sigma0-root cannot be combined with explicit Sigma0 paths'
         )
-    return Image.fromarray(array[..., 0], mode='L')
+    if sigma0_root is None:
+        if not all(has_explicit):
+            raise ValueError(
+                'provide --sigma0-root or all of --sigma0-before, '
+                '--sigma0-peak, and --sigma0-after'
+            )
+        paths = {
+            role: _require_path(path, kind='Sigma0 raster', role=role)
+            for role, path in explicit.items()
+        }
+        return paths, {
+            'input_mode': 'explicit',
+            'sigma0_root': None,
+            'sigma0_manifest': None,
+            'sigma0_manifest_version': None,
+        }
+
+    root = _require_directory(sigma0_root, kind='Sigma0 dataset directory')
+    manifest_path = root / SIGMA0_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'Sigma0 manifest is missing: {manifest_path}')
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f'could not read Sigma0 manifest: {manifest_path}') from exc
+    if not isinstance(manifest, dict) or manifest.get('format') != 'kulsary-sigma0':
+        raise ValueError(f'invalid Kulsary Sigma0 manifest: {manifest_path}')
+    roles = manifest.get('roles')
+    if not isinstance(roles, dict) or set(roles) != set(SIGMA0_ROOT_FILENAMES):
+        raise ValueError('Sigma0 manifest must contain before, peak, and after roles')
+
+    paths = {}
+    for role, filename in SIGMA0_ROOT_FILENAMES.items():
+        record = roles[role]
+        if not isinstance(record, dict) or record.get('output_filename') != filename:
+            raise ValueError(f'Sigma0 manifest filename mismatch for {role}')
+        path = _require_path(root / filename, kind='Sigma0 raster', role=role)
+        if sampled_file_fingerprint(path) != record.get('fingerprint'):
+            raise ValueError(f'Sigma0 manifest fingerprint mismatch for {role}')
+        paths[role] = path
+    return paths, {
+        'input_mode': 'sigma0-root',
+        'sigma0_root': str(root),
+        'sigma0_manifest': str(manifest_path.resolve()),
+        'sigma0_manifest_version': manifest.get('version'),
+    }
 
 
-def _to_image_tensor(image):
-    return torch.from_numpy(np.asarray(image, dtype=np.float32)).unsqueeze(0)
+def _validate_db_range(db_min, db_max):
+    if not math.isfinite(db_min) or not math.isfinite(db_max):
+        raise ValueError('db_min and db_max must be finite')
+    if db_min >= db_max:
+        raise ValueError('db_min must be smaller than db_max')
 
 
-def _to_mask_tensor(mask):
-    return torch.from_numpy(np.asarray(np.asarray(mask) > 0, dtype=np.int64))
+def _apply_d4(array, op):
+    if op == _D4_IDENTITY:
+        transformed = array
+    elif op == _D4_ROT90:
+        transformed = np.rot90(array, 1)
+    elif op == _D4_ROT180:
+        transformed = np.rot90(array, 2)
+    elif op == _D4_ROT270:
+        transformed = np.rot90(array, 3)
+    elif op == _D4_FLIP_LR:
+        transformed = np.fliplr(array)
+    elif op == _D4_FLIP_UD:
+        transformed = np.flipud(array)
+    elif op == _D4_TRANSPOSE:
+        transformed = array.T
+    elif op == _D4_TRANSVERSE:
+        transformed = np.fliplr(np.rot90(array, 1))
+    else:
+        raise ValueError(f'unsupported D4 op: {op}')
+    return np.ascontiguousarray(transformed)
+
+
+def _welford_combine(count, mean, second_moment, values):
+    """Combine a tile into a running Welford/Chan population accumulator."""
+    batch = np.asarray(values, dtype=np.float64).reshape(-1)
+    batch_count = int(batch.size)
+    if batch_count == 0:
+        return count, mean, second_moment
+    batch_mean = float(batch.mean())
+    batch_second = float(np.square(batch - batch_mean).sum())
+    if count == 0:
+        return batch_count, batch_mean, batch_second
+    delta = batch_mean - mean
+    total = count + batch_count
+    combined_mean = mean + delta * batch_count / total
+    combined_second = (
+        second_moment
+        + batch_second
+        + (delta * delta) * count * batch_count / total
+    )
+    return total, combined_mean, combined_second
+
+
+@dataclass
+class KulsarySceneIndex:
+    sigma0_paths: dict[str, Path]
+    mask_source: Path
+    mask_files: dict[str, Path]
+    grid: CommonGrid
+    water_masks: dict[str, np.ndarray]
+    kept_tiles: list[TileKey]
+    split_by_tile: dict[TileKey, str]
+    samples: list[AssignedRoleSample]
+    skips: list[dict]
+    db_min: float
+    db_max: float
+    block_tiles: int
+    train_ratio: float
+    val_ratio: float
+    test_ratio: float
+    split_seed: int
+
+    def samples_for(self, split):
+        if split not in OUTPUT_SPLITS:
+            raise ValueError(f'unsupported output split: {split}')
+        return [sample for sample in self.samples if sample.output_split == split]
+
+    def counts(self):
+        split_counts = {split: 0 for split in OUTPUT_SPLITS}
+        for sample in self.samples:
+            split_counts[sample.output_split] += 1
+        split_counts['tiles'] = len(self.kept_tiles)
+        split_counts['samples'] = len(self.samples)
+        return split_counts
+
+
+def grid_signature(grid):
+    return {
+        'crs': str(grid.crs),
+        'transform': [
+            float(grid.transform.a),
+            float(grid.transform.b),
+            float(grid.transform.c),
+            float(grid.transform.d),
+            float(grid.transform.e),
+            float(grid.transform.f),
+        ],
+        'width': int(grid.width),
+        'height': int(grid.height),
+        'peak_window': [
+            float(grid.peak_window.col_off),
+            float(grid.peak_window.row_off),
+            float(grid.peak_window.width),
+            float(grid.peak_window.height),
+        ],
+    }
+
+
+def tile_split_records(index):
+    return [
+        {
+            'row': tile.row,
+            'col': tile.col,
+            'split': index.split_by_tile[tile],
+        }
+        for tile in sorted(index.kept_tiles)
+    ]
+
+
+def source_fingerprints(index):
+    return {
+        'sigma0': {
+            role: sampled_file_fingerprint(index.sigma0_paths[role])
+            for role in _ROLE_ORDER
+        },
+        'masks': {
+            role: sampled_file_fingerprint(index.mask_files[role])
+            for role in _ROLE_ORDER
+        },
+    }
+
+
+def build_kulsary_scene_index(
+    sigma0_before,
+    sigma0_peak,
+    sigma0_after,
+    mask_source,
+    *,
+    db_min=-25.0,
+    db_max=0.0,
+    block_tiles=2,
+    train_ratio=0.8,
+    val_ratio=0.1,
+    test_ratio=0.1,
+    split_seed=42,
+):
+    """Index fully valid 256 tiles from linear Sigma0 GeoTIFFs and PNG/PGW masks."""
+    _validate_db_range(db_min, db_max)
+    sigma0_paths = {
+        'before': _require_path(sigma0_before, kind='Sigma0 raster', role='before'),
+        'peak': _require_path(sigma0_peak, kind='Sigma0 raster', role='peak'),
+        'after': _require_path(sigma0_after, kind='Sigma0 raster', role='after'),
+    }
+    mask_root = _require_directory(mask_source, kind='mask source directory')
+    mask_refs = discover_mask_refs(mask_root)
+
+    stack = Sigma0Stack(sigma0_paths, mask_ref=mask_refs['peak'])
+    try:
+        water_masks, coverage = warp_masks(mask_refs, stack.grid)
+        kept_tiles, skips = plan_valid_tiles(stack, coverage)
+        grid = stack.grid
+    finally:
+        stack.close()
+
+    if not kept_tiles:
+        raise ValueError('no fully valid 256x256 Kulsary tiles were found')
+
+    split_by_tile = assign_spatial_blocks(
+        kept_tiles,
+        block_tiles=block_tiles,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=split_seed,
+    )
+    samples = expand_role_samples(kept_tiles, split_by_tile)
+    _assert_role_cardinality(kept_tiles, samples)
+
+    return KulsarySceneIndex(
+        sigma0_paths=sigma0_paths,
+        mask_source=mask_root,
+        mask_files={role: mask_refs[role].png_path for role in _ROLE_ORDER},
+        grid=grid,
+        water_masks=water_masks,
+        kept_tiles=list(kept_tiles),
+        split_by_tile=dict(split_by_tile),
+        samples=list(samples),
+        skips=list(skips),
+        db_min=float(db_min),
+        db_max=float(db_max),
+        block_tiles=int(block_tiles),
+        train_ratio=float(train_ratio),
+        val_ratio=float(val_ratio),
+        test_ratio=float(test_ratio),
+        split_seed=int(split_seed),
+    )
+
+
+def _assert_role_cardinality(kept_tiles, samples):
+    kept = list(kept_tiles)
+    if len(samples) != 3 * len(kept):
+        raise ValueError(
+            'expected exactly 3 role samples per kept tile, '
+            f'got {len(samples)} samples for {len(kept)} tiles'
+        )
+    roles_by_tile = {}
+    for sample in samples:
+        roles_by_tile.setdefault(sample.tile, Counter())[sample.role] += 1
+    if set(roles_by_tile) != set(kept):
+        raise ValueError('role samples do not cover the kept tiles exactly once')
+    expected = {role: 1 for role in _ROLE_ORDER}
+    for tile, role_counts in roles_by_tile.items():
+        if dict(role_counts) != expected:
+            raise ValueError(
+                f'tile {tile} must have exactly one before, peak, and after sample, '
+                f'found {dict(role_counts)}'
+            )
+
+
+def compute_train_vv_stats(index):
+    """Population mean/std of clipped-dB VV over train samples only.
+
+    Each train role-tile is read through ``LazySigma0Stack.read_role`` and
+    converted with ``linear_sigma0_to_clipped_db``. Accumulators use a
+    streaming Welford/Chan update so the three scenes are never loaded at
+    once. The returned standard deviation is the population value
+    ``sqrt(M2 / n)``.
+    """
+    samples = index.samples_for('train')
+    if not samples:
+        raise ValueError('no training samples are available for VV stats')
+
+    count = 0
+    mean = 0.0
+    second_moment = 0.0
+    stack = LazySigma0Stack(index.sigma0_paths, index.grid)
+    try:
+        for sample in samples:
+            sigma0, valid = stack.read_role(sample.role, tile_window(sample.tile))
+            clipped_db = linear_sigma0_to_clipped_db(
+                sigma0,
+                valid,
+                index.db_min,
+                index.db_max,
+            )
+            count, mean, second_moment = _welford_combine(
+                count,
+                mean,
+                second_moment,
+                clipped_db,
+            )
+    finally:
+        stack.close()
+
+    if count <= 0:
+        raise ValueError('training VV stats received no pixels')
+    std = math.sqrt(second_moment / count)
+    if not math.isfinite(mean) or not math.isfinite(std) or std <= 0.0:
+        raise ValueError('training VV std must be finite and positive')
+    return float(mean), float(std)
 
 
 class RandomD4(object):
     def __call__(self, image, mask):
-        op = _D4_OPS[random.randrange(8)]
-        if op is None:
-            return image, mask
-        return image.transpose(op), mask.transpose(op)
-
-
-class SingleTemporalWaterDataset(data.Dataset):
-    def __init__(self, records, augment=False):
-        self.records = records
-        self.augment = augment
-        self._d4 = RandomD4() if augment else None
-
-    def __getitem__(self, index):
-        record = self.records[index]
-        path = record['image']
-        name = record['name']
-        image = _as_single_channel_vv(_open_rgb(path), path)
-        mask = _open_binary_mask(record['mask'])
-        if image.size != mask.size:
+        image_array = np.asarray(image)
+        mask_array = np.asarray(mask)
+        if image_array.ndim != 2 or mask_array.ndim != 2:
+            raise ValueError('D4 augmentation requires 2-D image and mask arrays')
+        if image_array.shape != mask_array.shape:
             raise ValueError(
-                f'image/mask size mismatch for {name}: '
-                f'{image.size} vs {mask.size}'
+                'image/mask shape mismatch for D4: '
+                f'{image_array.shape} vs {mask_array.shape}'
             )
-        if self.augment and image.width != image.height:
+        if image_array.shape[0] != image_array.shape[1]:
             raise ValueError(
-                f'D4 augmentation requires a square VV patch for {name}: '
-                f'{image.size}'
+                'D4 augmentation requires a square VV patch: '
+                f'{image_array.shape}'
+            )
+        op = random.randrange(8)
+        return _apply_d4(image_array, op), _apply_d4(mask_array, op)
+
+
+class KulsaryRawWaterDataset(data.Dataset):
+    def __init__(self, index, split, augment=False):
+        if split not in OUTPUT_SPLITS:
+            raise ValueError(f'unsupported output split: {split}')
+        self.index = index
+        self.split = split
+        self.augment = bool(augment)
+        self.samples = list(index.samples_for(split))
+        self._d4 = RandomD4() if self.augment else None
+        self._stack = LazySigma0Stack(index.sigma0_paths, index.grid)
+
+    def __getitem__(self, sample_index):
+        sample = self.samples[sample_index]
+        sigma0, valid = self._stack.read_role(sample.role, tile_window(sample.tile))
+        if sigma0.shape != (PATCH_SIZE, PATCH_SIZE):
+            raise ValueError(
+                f'expected {PATCH_SIZE}x{PATCH_SIZE} Sigma0 tile for {sample.name}, '
+                f'got {sigma0.shape}'
+            )
+        if valid.shape != sigma0.shape or not bool(valid.all()):
+            raise ValueError(f'Sigma0 tile is not fully valid for {sample.name}')
+        image = linear_sigma0_to_clipped_db(
+            sigma0,
+            valid,
+            self.index.db_min,
+            self.index.db_max,
+        )
+        mask = np.asarray(
+            self.index.water_masks[sample.role][tile_slice(sample.tile)],
+            dtype=bool,
+        )
+        if mask.shape != (PATCH_SIZE, PATCH_SIZE):
+            raise ValueError(
+                f'expected {PATCH_SIZE}x{PATCH_SIZE} water mask for {sample.name}, '
+                f'got {mask.shape}'
             )
         if self.augment:
             image, mask = self._d4(image, mask)
-        return _to_image_tensor(image), _to_mask_tensor(mask), name
+        image_tensor = torch.from_numpy(
+            np.ascontiguousarray(image, dtype=np.float32)
+        ).unsqueeze(0)
+        mask_tensor = torch.from_numpy(np.asarray(mask, dtype=np.int64))
+        return image_tensor, mask_tensor, sample.name
 
     def __len__(self):
-        return len(self.records)
+        return len(self.samples)
+
+    def close(self):
+        stack = getattr(self, '_stack', None)
+        if stack is not None:
+            stack.close()
+
+    def __getstate__(self):
+        self.close()
+        return dict(self.__dict__)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if getattr(self, '_stack', None) is None:
+            self._stack = LazySigma0Stack(self.index.sigma0_paths, self.index.grid)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
-def build_water_dataset(data_dir, split, augment=False):
-    records = flatten_water_records(_build_split_dataset(data_dir, split))
-    return SingleTemporalWaterDataset(records, augment=augment)
+def water_worker_init_fn(worker_id):
+    """Close inherited raster handles and reseed per DataLoader worker."""
+    info = torch.utils.data.get_worker_info()
+    if info is not None and hasattr(info.dataset, 'close'):
+        info.dataset.close()
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(int(seed))
 
 
 def _water_loader(dataset, batch_size, num_workers, shuffle):
-    return data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        drop_last=False,
-        pin_memory=torch.cuda.is_available(),
-    )
+    kwargs = {
+        'batch_size': batch_size,
+        'shuffle': shuffle,
+        'num_workers': num_workers,
+        'drop_last': False,
+        'pin_memory': torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        kwargs['worker_init_fn'] = water_worker_init_fn
+        kwargs['multiprocessing_context'] = 'spawn'
+    return data.DataLoader(dataset, **kwargs)
 
 
-def get_water_loaders(data_dir, batch_size, num_workers, augmentation=True):
-    train_dataset = build_water_dataset(
-        data_dir,
+def get_water_loaders(index, batch_size, num_workers, augmentation=True):
+    train_dataset = KulsaryRawWaterDataset(
+        index,
         'train',
         augment=augmentation,
     )
-    val_dataset = build_water_dataset(data_dir, 'val', augment=False)
+    val_dataset = KulsaryRawWaterDataset(index, 'val', augment=False)
     return (
         _water_loader(train_dataset, batch_size, num_workers, shuffle=True),
         _water_loader(val_dataset, batch_size, num_workers, shuffle=False),
     )
 
 
-def get_water_test_loader(data_dir, batch_size, num_workers):
-    test_dataset = build_water_dataset(data_dir, 'test', augment=False)
+def get_water_test_loader(index, batch_size, num_workers):
+    test_dataset = KulsaryRawWaterDataset(index, 'test', augment=False)
     return _water_loader(test_dataset, batch_size, num_workers, shuffle=False)

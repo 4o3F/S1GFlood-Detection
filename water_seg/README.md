@@ -1,60 +1,97 @@
-# Single-Temporal VV Water Segmentation
+# Kulsary Single-Temporal VV Water Segmentation
 
-This package provides a standalone binary water-segmentation baseline for the prepared datasets used by this repository. It does not call or modify the bi-temporal DAM-Net change-detection path.
+The Kulsary workflow has two explicit stages:
 
-## Reference baseline
+1. restored Sentinel-1 GRD SAFE → stable linear `Sigma0_VV` GeoTIFF dataset;
+2. Sigma0 dataset + original PNG/PGW water masks → Swin-T U-Net training/evaluation.
 
-The architecture and training defaults follow the single-image SAR benchmark in [GEOID-Flood](https://github.com/links-ads/geoid-flood) at commit `b0ab63540a2a331513be306a5cbdc4ba88c766f5`:
+SNAP runs only in stage 1. The training DataLoader never reads SAFE products or invokes SNAP.
 
-- Swin-T encoder with four feature scales;
-- U-Net decoder channels `[512, 256, 128, 64]`;
-- cross-entropy loss, D4 augmentation, AdamW, cosine scheduling, and validation water-IoU selection;
-- ImageNet encoder initialization by default.
+## Stage 1: prepare the Sigma0 dataset
 
-GEOID-Flood reports `F1_bin=0.929`, `IoU_bin=0.873`, and post-hoc `IoU_flood=0.469` for its Swin-T baseline. Those values are reference targets only: GEOID uses VV+VH dB rasters, different labels, event splits, and `255` as ignore. This implementation uses the current project's VV-only PNGs and treats `255` in `WATER_GT_*` as water, so its metrics are not directly comparable.
+The restored root may contain top-level standard SAFEs and duplicate `products/` links into `*_COG` wrapper directories. Discovery collapses copies by product identifier and prefers restore-managed `products/` targets. For the current Kulsary scene the selected identifiers are `_5249.SAFE`, `_75FD.SAFE`, and `_779A.SAFE`.
 
-Reference files:
-
-- [GEOID Swin-T configuration](https://github.com/links-ads/geoid-flood/blob/b0ab63540a2a331513be306a5cbdc4ba88c766f5/configs/backbone_benchmark/swin_tiny.yaml)
-- [GEOID dataset implementation](https://github.com/links-ads/geoid-flood/blob/b0ab63540a2a331513be306a5cbdc4ba88c766f5/src/geoid_flood/datasets/geoid.py)
-- [GEOID paper](https://arxiv.org/abs/2608.02315)
-
-## Dataset contract
-
-The root must use the existing prepared layout:
-
-```text
-<dataset>/
-  train/
-    A/ B/ GT/
-    WATER_GT_A/ WATER_GT_B/
-  val/
-    A/ B/ GT/
-    WATER_GT_A/ WATER_GT_B/
-  test/
-    A/ B/ GT/
-    WATER_GT_A/ WATER_GT_B/
+```shell
+uv run python prepare_kulsary_sigma0.py \
+  --safe-root /home/ubuntu/lhx/Sentinel1-SAR/restored_grd \
+  --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --gpt /usr/local/esa-snap/bin/gpt
 ```
 
-Each labeled temporal pair is flattened into two independent samples:
+The script uses the existing content-addressed SNAP cache. Cache hits are reused; a missing date is preprocessed once in the parent process. Defaults match the Kulsary pair converter: Precise orbit, Copernicus 30 m DEM, `EPSG:32639`, and 10 m pixels.
+
+Output:
 
 ```text
-(A/<name>, WATER_GT_A/<name>)
-(B/<name>, WATER_GT_B/<name>)
+kulsary_sigma0/
+  before_sigma0_vv.tif
+  peak_sigma0_vv.tif
+  after_sigma0_vv.tif
+  sigma0_manifest.json
 ```
 
-Change-only records without `WATER_GT_A/B` are omitted rather than interpreted as dry pixels. A split with no complete-water labels fails explicitly. Plain S1GFloods `GT` is a flood-change mask and is not a valid target for this model; use prepared ETCI/Kulsary data or a merged root containing `WATER_GT_A/B`.
+The GeoTIFFs are hardlinked from immutable cache generations when possible and copied across filesystems. Publication is atomic. Use `--dry-run` to inspect product bindings/cache status and `--refresh-snap-cache` to rebuild cache entries deliberately.
 
-The source PNG must contain the same VV grayscale values in all three RGB channels. The loader verifies this and returns one raw `float32` channel in `[0,255]`. Training patches must be square when D4 augmentation is enabled (the prepared project patches are `256×256`). The model internally replicates that VV channel, scales it, and applies ImageNet normalization before Swin-T.
+## Masks
 
-Masks may contain `{0,1}` or `{0,255}`. Both `1` and `255` mean water; there is no ignore class in this project-specific path.
+The mask root is used only in stage 2:
 
-## Training
+```text
+kulsary_masks/
+  1_water_before_20240402.png
+  1_water_before_20240402.pgw
+  2_water_during_20240414.png
+  2_water_during_20240414.pgw
+  3_water_after_20240426.png
+  3_water_after_20240426.pgw
+  _preview_3panel.png
+```
+
+The three formal PNG+PGW pairs are discovered uniquely; files beginning with `_`, including the preview, are ignored. Masks are interpreted as EPSG:4326.
+
+## Stage 2: training
 
 ```shell
 uv run python -m water_seg.train \
-  --dataset-dir /path/to/prepared-or-merged-dataset
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks
 ```
+
+The Sigma0 root manifest and sampled fingerprints are verified before loading. Advanced/test use may supply all three files explicitly instead:
+
+```shell
+uv run python -m water_seg.train \
+  --sigma0-before /path/to/before_sigma0_vv.tif \
+  --sigma0-peak /path/to/peak_sigma0_vv.tif \
+  --sigma0-after /path/to/after_sigma0_vv.tif \
+  --mask-source /path/to/kulsary_masks
+```
+
+`--sigma0-root` and explicit paths are mutually exclusive.
+
+## Spatial and temporal sampling
+
+Peak Sigma0 defines the common grid. Before/after are read through bilinear `WarpedVRT`; masks are nearest-neighbor reprojected. Only non-overlapping 256×256 windows with complete mask coverage and finite positive Sigma0 in all dates are retained.
+
+Each retained tile contributes exactly:
+
+```text
+before
+peak
+after
+```
+
+The old prepared pair path exposed peak twice; direct loading produces `3N` unique-date samples. Tiles use deterministic spatial super-block splitting (default 2×2 blocks, 80/10/10, split seed 42).
+
+## Radiometry and model
+
+Linear Sigma0 is converted in memory:
+
+```text
+10 * log10(Sigma0) → clip [-25,0] dB
+```
+
+No uint8 quantization or RGB ImageNet normalization is applied. Mean and population standard deviation are computed only from the train split. Swin-T uses a one-channel stem initialized from adapted ImageNet weights and a four-scale U-Net decoder `[512,256,128,64]`.
 
 Important defaults:
 
@@ -62,35 +99,39 @@ Important defaults:
 |---|---:|
 | Epochs | 20 |
 | Batch size | 8 |
+| DataLoader workers | 0 |
 | Encoder LR | `5e-5` |
 | Decoder LR | `5e-4` |
 | Weight decay | `0.01` |
-| Scheduler | cosine, `eta_min=1e-6` |
+| dB range | `[-25,0]` |
+| Split | `0.8 / 0.1 / 0.1` |
+| Split seed | 42 |
 | Augmentation | uniform D4 |
-| Early-stop patience | 5 validation checks |
-| Checkpoint metric | water IoU |
-| Save directory | `.tmp/water_swin_tiny_unet` |
+| Early-stop patience | 5 |
+| Checkpoint metric | water-class IoU |
 
-ImageNet Swin-T weights are obtained through the pinned `timm==0.6.13`. For an offline or random-initialization run:
-
-```shell
-uv run python -m water_seg.train \
-  --dataset-dir /path/to/dataset \
-  --no-imagenet-pretrained
-```
-
-The trainer writes `best.pth`, `last.pth`, and TensorBoard logs. Checkpoints are state-dictionary bundles rather than pickled model objects.
+Higher worker counts use multiprocessing `spawn` and per-process lazy raster reopening.
 
 ## Evaluation
 
+When checkpoint paths still exist:
+
 ```shell
 uv run python -m water_seg.eval \
-  --dataset-dir /path/to/dataset \
   --path .tmp/water_swin_tiny_unet/best.pth
 ```
 
-Evaluation uses both independently flattened dates from the test split and reports global loss, precision, recall, F1, overall accuracy, and water IoU.
+To relocate the same Sigma0 dataset:
 
-## Scope
+```shell
+uv run python -m water_seg.eval \
+  --sigma0-root /new/path/kulsary_sigma0 \
+  --mask-source /new/path/kulsary_masks \
+  --path .tmp/water_swin_tiny_unet/best.pth
+```
 
-This package supports patch training and patch evaluation only. Single-SAFE preprocessing, sliding-window inference, probability mosaics, and GeoTIFF output are intentionally outside the first implementation.
+Evaluation verifies file fingerprints, common grid, exact tile identities, and split membership. Checkpoint format 2 stores one-channel clipped-dB normalization; format 1 checkpoints are rejected and require retraining.
+
+## Relationship to DAM-Net
+
+`prepare_kulsary_pairs.py` remains the bi-temporal DAM-Net converter and still emits both pair variants plus prepared `A/B/GT/WATER_GT_*` trees. `water_seg` does not consume those trees.

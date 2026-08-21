@@ -371,6 +371,44 @@ class ConverterIntegrationTest(unittest.TestCase):
             expected_paths,
         )
 
+    def test_mixed_tree_prefers_products_nested_targets(self):
+        dates = {
+            "before": "2024-04-02",
+            "peak": "2024-04-14",
+            "after": "2024-04-26",
+        }
+        products_dir = self.safe_root / "products"
+        products_dir.mkdir()
+        expected_paths = {}
+
+        for role, original in self.safe_paths.items():
+            nested = self.safe_root / f"{role}_COG" / original.name
+            write_safe(nested, dates[role])
+            (products_dir / original.name).symlink_to(
+                Path("..") / f"{role}_COG" / original.name,
+                target_is_directory=True,
+            )
+            expected_paths[role] = nested.resolve()
+            self.assertTrue(original.is_dir())
+            self.assertNotEqual(original.resolve(), expected_paths[role])
+
+        write_safe(
+            self.safe_root / "predicted" / "ignored.SAFE",
+            dates["before"],
+        )
+        (self.safe_root / "logs").mkdir()
+        (self.safe_root / "logs" / "restore.log").write_text(
+            "ignored\n",
+            encoding="utf-8",
+        )
+
+        products = converter._discover_products(self.safe_root)
+        self.assertEqual(set(products), {"before", "peak", "after"})
+        self.assertEqual(
+            {role: product.root for role, product in products.items()},
+            expected_paths,
+        )
+
     def test_dry_run_never_resolves_gpt_or_writes(self):
         with mock.patch.object(
             converter,

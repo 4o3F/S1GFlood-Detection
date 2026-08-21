@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,10 +8,9 @@ from timm.models.layers import trunc_normal_
 from swin_transformer import swin
 
 
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
 _TIMM_SWIN_TINY = 'swin_tiny_patch4_window7_224'
 _MIN_MATCHED_PRETRAINED_TENSORS = 100
+_PATCH_EMBED_WEIGHT = 'patch_embed.proj.weight'
 
 
 def _is_ignored_pretrained_key(name):
@@ -20,6 +21,7 @@ def _is_ignored_pretrained_key(name):
 
 def _load_timm_swin_tiny_weights(encoder):
     import timm
+    from timm.models.helpers import adapt_input_conv
 
     source = timm.create_model(_TIMM_SWIN_TINY, pretrained=True, in_chans=3)
     source_state = source.state_dict()
@@ -32,7 +34,11 @@ def _load_timm_swin_tiny_weights(encoder):
         if name.startswith('norm.'):
             destination_name = name.replace('norm.', 'norm3.', 1)
         dest = dest_state.get(destination_name)
-        if dest is not None and dest.shape == tensor.shape:
+        if dest is None:
+            continue
+        if name == _PATCH_EMBED_WEIGHT:
+            tensor = adapt_input_conv(1, tensor)
+        if dest.shape == tensor.shape:
             matched[destination_name] = tensor
     if len(matched) < _MIN_MATCHED_PRETRAINED_TENSORS:
         raise RuntimeError(
@@ -47,7 +53,7 @@ class SwinTinyEncoder(swin):
     def __init__(self, imagenet_pretrained=False):
         super().__init__(
             None,
-            in_chans=3,
+            in_chans=1,
             embed_dim=96,
             depths=(2, 2, 6, 2),
             num_heads=(3, 6, 12, 24),
@@ -123,14 +129,19 @@ class SwinTinyUNet(nn.Module):
         self.dec4 = DecoderBlock(128, 0, 64)
         self.dropout = nn.Dropout2d(0.3)
         self.head = nn.Conv2d(64, 2, kernel_size=1)
-        self.register_buffer(
-            'imagenet_mean',
-            torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            'imagenet_std',
-            torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1),
-        )
+        self.register_buffer('vv_mean', torch.zeros(1, 1, 1, 1))
+        self.register_buffer('vv_std', torch.ones(1, 1, 1, 1))
+
+    def set_vv_normalization(self, mean, std):
+        mean = float(mean)
+        std = float(std)
+        if not math.isfinite(mean):
+            raise ValueError(f'vv mean must be finite, got {mean}')
+        if not math.isfinite(std) or std <= 0:
+            raise ValueError(f'vv std must be finite and positive, got {std}')
+        self.vv_mean.fill_(mean)
+        self.vv_std.fill_(std)
+        return self
 
     def _prepare_input(self, x):
         if x.ndim != 4 or x.size(1) != 1:
@@ -138,9 +149,8 @@ class SwinTinyUNet(nn.Module):
                 'SwinTinyUNet expects a single VV channel of shape [B, 1, H, W], '
                 f'got {tuple(x.shape)}'
             )
-        x = x.to(dtype=self.imagenet_mean.dtype) / 255.0
-        x = x.repeat(1, 3, 1, 1)
-        return (x - self.imagenet_mean) / self.imagenet_std
+        x = x.to(device=self.vv_mean.device, dtype=self.vv_mean.dtype)
+        return (x - self.vv_mean) / self.vv_std
 
     def forward(self, x):
         original_size = x.shape[-2:]

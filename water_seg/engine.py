@@ -6,7 +6,33 @@ import numpy as np
 import torch
 
 
-CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FORMAT_VERSION = 2
+INPUT_CONTRACT = 'single VV channel, clipped dB'
+NORMALIZATION_CONTRACT = 'train-split clipped-dB mean/std'
+_REQUIRED_CONFIG_KEYS = {
+    'architecture',
+    'input',
+    'in_chans',
+    'normalization',
+    'vv_mean',
+    'vv_std',
+    'db_min',
+    'db_max',
+    'sigma0_before',
+    'sigma0_peak',
+    'sigma0_after',
+    'mask_source',
+    'split_seed',
+    'block_tiles',
+    'train_ratio',
+    'val_ratio',
+    'test_ratio',
+    'kept_tile_count',
+    'samples_per_split',
+    'grid_signature',
+    'tile_splits',
+    'source_fingerprints',
+}
 
 
 def seed_everything(seed):
@@ -80,6 +106,17 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     return metrics
 
 
+def close_loader(loader):
+    if loader is None:
+        return
+    iterator = getattr(loader, '_iterator', None)
+    if iterator is not None and hasattr(iterator, '_shutdown_workers'):
+        iterator._shutdown_workers()
+    dataset = getattr(loader, 'dataset', None)
+    if dataset is not None and hasattr(dataset, 'close'):
+        dataset.close()
+
+
 def build_optimizer(model, encoder_lr, decoder_lr, weight_decay):
     encoder_parameters = list(model.encoder.parameters())
     decoder_parameters = [
@@ -131,6 +168,97 @@ def save_checkpoint(path, payload):
     os.replace(temporary_path, checkpoint_path)
 
 
+def _validate_checkpoint_config(config, expected_architecture):
+    if not isinstance(config, dict):
+        raise ValueError('water checkpoint config must be a dictionary')
+    missing = sorted(_REQUIRED_CONFIG_KEYS - config.keys())
+    if missing:
+        raise ValueError(
+            f'water checkpoint config is missing required keys: {missing}'
+        )
+    if expected_architecture is not None:
+        architecture = config.get('architecture')
+        if architecture != expected_architecture:
+            raise ValueError(
+                f'checkpoint architecture must be {expected_architecture}, '
+                f'got {architecture}'
+            )
+    if config.get('input') != INPUT_CONTRACT:
+        raise ValueError(
+            f'checkpoint input contract must be {INPUT_CONTRACT}'
+        )
+    if config.get('normalization') != NORMALIZATION_CONTRACT:
+        raise ValueError(
+            'checkpoint normalization contract must be '
+            f'{NORMALIZATION_CONTRACT}'
+        )
+    if config.get('in_chans') != 1:
+        raise ValueError('water checkpoint must use one VV input channel')
+
+    vv_mean = float(config['vv_mean'])
+    vv_std = float(config['vv_std'])
+    if not np.isfinite(vv_mean):
+        raise ValueError('checkpoint vv_mean must be finite')
+    if not np.isfinite(vv_std) or vv_std <= 0:
+        raise ValueError('checkpoint vv_std must be finite and positive')
+
+    db_min = float(config['db_min'])
+    db_max = float(config['db_max'])
+    if not np.isfinite(db_min) or not np.isfinite(db_max) or db_min >= db_max:
+        raise ValueError('checkpoint dB range is invalid')
+
+    samples_per_split = config['samples_per_split']
+    if not isinstance(samples_per_split, dict):
+        raise ValueError('checkpoint samples_per_split must be a dictionary')
+    for split in ('train', 'val', 'test'):
+        value = samples_per_split.get(split)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f'checkpoint samples_per_split[{split}] must be non-negative'
+            )
+
+    grid = config['grid_signature']
+    if not isinstance(grid, dict):
+        raise ValueError('checkpoint grid_signature must be a dictionary')
+    required_grid = {'crs', 'transform', 'width', 'height', 'peak_window'}
+    if required_grid - grid.keys():
+        raise ValueError('checkpoint grid_signature is incomplete')
+    if len(grid['transform']) != 6 or len(grid['peak_window']) != 4:
+        raise ValueError('checkpoint grid_signature has invalid dimensions')
+
+    kept_tile_count = config['kept_tile_count']
+    if not isinstance(kept_tile_count, int) or kept_tile_count <= 0:
+        raise ValueError('checkpoint kept_tile_count must be positive')
+    tile_splits = config['tile_splits']
+    if not isinstance(tile_splits, list) or len(tile_splits) != kept_tile_count:
+        raise ValueError(
+            'checkpoint tile_splits must contain one record per kept tile'
+        )
+    for record in tile_splits:
+        if not isinstance(record, dict):
+            raise ValueError('checkpoint tile_splits records must be dictionaries')
+        if set(record) != {'row', 'col', 'split'}:
+            raise ValueError('checkpoint tile_splits record has invalid fields')
+        if record['split'] not in {'train', 'val', 'test'}:
+            raise ValueError('checkpoint tile_splits has an invalid split')
+
+    fingerprints = config['source_fingerprints']
+    if not isinstance(fingerprints, dict) or set(fingerprints) != {'sigma0', 'masks'}:
+        raise ValueError('checkpoint source_fingerprints has invalid groups')
+    for group in ('sigma0', 'masks'):
+        records = fingerprints[group]
+        if not isinstance(records, dict) or set(records) != {'before', 'peak', 'after'}:
+            raise ValueError(
+                f'checkpoint source_fingerprints[{group}] has invalid roles'
+            )
+        for record in records.values():
+            if not isinstance(record, dict) or set(record) != {
+                'size',
+                'sampled_sha256',
+            }:
+                raise ValueError('checkpoint source fingerprint is invalid')
+
+
 def load_model_checkpoint(
     path,
     model,
@@ -144,10 +272,16 @@ def load_model_checkpoint(
     )
     if not isinstance(checkpoint, dict):
         raise ValueError('water checkpoint must be a dictionary')
-    if checkpoint.get('format_version') != CHECKPOINT_FORMAT_VERSION:
+    format_version = checkpoint.get('format_version')
+    if format_version != CHECKPOINT_FORMAT_VERSION:
+        if format_version == 1:
+            raise ValueError(
+                'water checkpoint format 1 used quantized 0-255 VV with an '
+                'RGB ImageNet stem; retrain for format 2 clipped-dB input'
+            )
         raise ValueError(
             'unsupported water checkpoint format: '
-            f"{checkpoint.get('format_version')}"
+            f'{format_version}'
         )
 
     required = {'epoch', 'best_water_iou', 'model_state_dict', 'config'}
@@ -156,15 +290,18 @@ def load_model_checkpoint(
         raise ValueError(
             f'water checkpoint is missing required keys: {missing}'
         )
-    if not isinstance(checkpoint['config'], dict):
-        raise ValueError('water checkpoint config must be a dictionary')
-    if expected_architecture is not None:
-        architecture = checkpoint['config'].get('architecture')
-        if architecture != expected_architecture:
-            raise ValueError(
-                f'checkpoint architecture must be {expected_architecture}, '
-                f'got {architecture}'
-            )
+    _validate_checkpoint_config(
+        checkpoint['config'],
+        expected_architecture,
+    )
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    if hasattr(model, 'vv_mean') and hasattr(model, 'vv_std'):
+        config = checkpoint['config']
+        model_mean = float(model.vv_mean.detach().cpu().item())
+        model_std = float(model.vv_std.detach().cpu().item())
+        if not np.isclose(model_mean, float(config['vv_mean'])):
+            raise ValueError('checkpoint vv_mean disagrees with model state')
+        if not np.isclose(model_std, float(config['vv_std'])):
+            raise ValueError('checkpoint vv_std disagrees with model state')
     return checkpoint

@@ -35,6 +35,13 @@ def nonnegative_float(value):
     return parsed
 
 
+def finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ag.ArgumentTypeError('value must be finite')
+    return parsed
+
+
 def parser_with_args(metadata_json='metadata_file.json'):
     parser = ag.ArgumentParser(description='Training flood detection network with S1GFloods')
 

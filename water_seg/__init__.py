@@ -1,1 +1,1 @@
-"""Standalone single-temporal VV water segmentation."""
+"""Direct Kulsary Sigma0 VV water segmentation."""

@@ -2,73 +2,100 @@
 
 ## Goal
 
-Provide a single-temporal, VV-only water-segmentation baseline while preserving every public contract of the existing bi-temporal DAM-Net implementation.
+Optimize single-temporal water segmentation for the Kulsary target domain through a reproducible two-stage boundary: restored GRD SAFE products are first published as a stable three-file Sigma0 dataset, then training reads only that dataset and the original full-water masks. This eliminates prepared-pair peak duplication, uint8 quantization, and RGB ImageNet normalization without changing the legacy DAM-Net pipeline.
 
-## Module boundaries
-
-```text
-water_seg.dataset  -> prepared A/B/WATER_GT records and D4 transforms
-water_seg.model    -> single-channel adapter, Swin-T encoder, U-Net decoder
-water_seg.engine   -> shared train/eval loop, metrics, optimizer, checkpoints
-water_seg.train    -> training CLI
-water_seg.eval     -> patch-evaluation CLI
-```
-
-The package reuses the existing dataset validation functions, while keeping its runtime metrics, seeding, optimizer, and checkpoint code isolated from the DAM-Net training entry point. It does not modify or instantiate `DAMNet_New`.
-
-## Data flow
-
-1. `utils.dataloaders._build_split_dataset` validates the existing split layout and optional paired water masks.
-2. `flatten_water_records` drops change-only records and emits A and B as independent samples.
-3. `SingleTemporalWaterDataset` verifies replicated-VV RGB input, extracts one channel, applies a synchronized D4 transform during training, and returns `(image, mask, name)`.
-4. `SwinTinyUNet` receives `[B,1,H,W]` raw VV intensity, scales to `[0,1]`, replicates to three channels, and applies ImageNet normalization.
-5. The local hierarchical Swin-T produces `/4`, `/8`, `/16`, and `/32` features with channels `96`, `192`, `384`, and `768`.
-6. The U-Net decoder fuses all four scales through channels `512`, `256`, `128`, and `64`, then returns two-class full-resolution logits.
-
-## Encoder initialization
-
-The legacy `swin_transformer.swin` constructor unconditionally loads `./PRETRAINED`. `SwinTinyEncoder` subclasses it and overrides only `init_weights`, preserving the encoder implementation while preventing that broken path from affecting this standalone model.
-
-When ImageNet initialization is enabled, a classification-form Swin-T from the repository's pinned `timm==0.6.13` supplies matching encoder tensors. The final classification normalization is mapped to the local deepest-stage `norm3`; classification-head and fixed attention-mask-only keys are ignored. The runtime encoder remains the local size-flexible implementation, so 256-pixel project patches do not inherit timm's fixed classification forward.
-
-## Optimization
-
-The optimizer has two explicit parameter groups:
-
-- encoder: `5e-5` by default;
-- decoder and segmentation head: `5e-4` by default.
-
-Both use AdamW with weight decay `0.01`; cosine annealing runs for the configured epoch budget. Cross-entropy is applied to complete-water targets. Validation water IoU controls the best checkpoint and early stopping.
-
-## Checkpoint contract
-
-Water checkpoints use format version `1` and contain:
+## Boundaries
 
 ```text
-model_state_dict
-optimizer_state_dict
-scheduler_state_dict
-epoch
-best_water_iou
-train_metrics
-val_metrics
-config
+utils.kulsary_products    -> duplicate-safe restored SAFE discovery
+prepare_kulsary_sigma0.py -> parent-only SNAP/cache and atomic Sigma0 publish
+utils.kulsary_raster      -> common grid, raster windows, mask warp, tile validity
+utils.kulsary_temporal    -> dates, spatial split, unique role samples
+water_seg.dataset         -> Sigma0-root validation, scene index, stats, loaders
+water_seg.model           -> one-channel Swin-T encoder and U-Net decoder
+water_seg.engine          -> metrics, optimizer, checkpoint format 2
+water_seg.train/eval      -> Sigma0-only training/evaluation CLIs
 ```
 
-This avoids the arbitrary-code and compatibility issues of full-module pickle checkpoints used by the legacy DAM-Net path.
+Training accepts a canonical precomputed Sigma0 root or three explicit GeoTIFFs. SAFE discovery and SNAP execution are confined to the standalone preprocessing script; DataLoader workers cannot reach them.
+
+## Stage-one SAFE publication
+
+`discover_kulsary_grd_products` scans top-level and `products/` SAFE entries, collapses duplicate copies by product identifier, and prefers restore-managed `products/` targets. `prepare_kulsary_sigma0.py` reuses or builds content-addressed SNAP cache entries in the parent process, then atomically publishes canonical before/peak/after GeoTIFFs and a fingerprinted manifest. Hardlinks preserve immutable cache bytes without duplication; copy is the cross-filesystem fallback.
+
+## Spatial data flow
+
+1. Discover the three PNG+PGW masks and validate identical size/affine.
+2. Open the three one-band Sigma0 GeoTIFFs. Peak defines the common grid; before/after use bilinear `WarpedVRT`.
+3. Clip the grid to the three raster extents and mask extent.
+4. Reproject full-water masks from EPSG:4326 using nearest-neighbor.
+5. Enumerate non-overlapping 256×256 windows, dropping partial edges, incomplete mask coverage, or any tile with invalid/nonpositive Sigma0 in any date.
+6. Assign valid tiles to deterministic 2×2 spatial super-block train/val/test splits.
+7. Expand each tile to exactly `before`, `peak`, and `after` samples. The pair converter's second peak occurrence is not used.
+
+`KulsarySceneIndex` owns paths, immutable grid metadata, warped masks, tiles, splits, role samples, and provenance. It does not retain open GDAL handles.
+
+## Worker-safe raster access
+
+`LazySigma0Stack` stores only paths and `CommonGrid`. It opens rasterio datasets and VRTs on first access, records the process PID, drops handles during pickle, and reopens when the PID changes. Multi-worker DataLoaders use the `spawn` context, so workers receive a handle-free serialized dataset; worker initialization resets the lazy stack and reseeds Python/NumPy from `torch.initial_seed()`.
+
+No worker performs grid planning, mask reprojection, or SNAP processing.
+
+## Radiometry
+
+Dataset samples remain float32 clipped dB:
+
+```text
+linear Sigma0 → 10*log10 → clip [db_min, db_max]
+```
+
+Train-split role tiles alone provide streaming population mean/std. Validation and test pixels never contribute to normalization statistics.
+
+The local Swin-T patch embedding is one channel. ImageNet initialization adapts the timm RGB patch weights with `adapt_input_conv(1, weight)`, maps the final timm normalization to local `norm3`, and copies the remaining matching tensors. Forward normalization is `(VV_dB - vv_mean) / vv_std`.
+
+## Model
+
+The encoder produces four scales:
+
+```text
+/4  : 96 channels
+/8  : 192 channels
+/16 : 384 channels
+/32 : 768 channels
+```
+
+The U-Net decoder uses channels `[512,256,128,64]` and returns two-class full-resolution logits. DAM-Net and its auxiliary water head are not instantiated.
+
+## Checkpoint format 2
+
+The checkpoint stores model/optimizer/scheduler state, metrics, and required provenance:
+
+```text
+input = single VV channel, clipped dB
+normalization = train-split clipped-dB mean/std
+vv_mean / vv_std
+db_min / db_max
+three Sigma0 source paths and mask source
+split seed, block size, split ratios
+common-grid signature
+exact kept tile identities and split membership
+sampled content fingerprints for all Sigma0 and mask files
+samples per split
+```
+
+Evaluation rebuilds the index with checkpoint paths or explicit relocation paths, applies checkpoint split/dB parameters, and verifies the common grid plus every kept tile's split membership. Format 1 checkpoints are rejected because their three-channel quantized input stem is incompatible.
 
 ## Compatibility invariants
 
-- `DAMNet_New.forward(x1, x2)` remains unchanged.
-- Existing auxiliary `WaterSegmentationHead` behavior remains unchanged.
-- Existing change loaders, transforms, train/eval entry points, and SAFE inference remain unchanged.
-- `255` remains a positive water value for `WATER_GT_*`; GEOID's `255=ignore` convention is not imported.
-- Missing complete-water labels never become synthetic background supervision.
-- The external model contract remains one VV tensor channel even though the encoder internally receives replicated normalized values for ImageNet compatibility.
+- `prepare_kulsary_pairs.py` still emits both change pair variants and all prepared directories/manifests.
+- DAM-Net `train.py`, `eval.py`, loaders, ETCI conversion, and merge tooling remain unchanged.
+- Water targets are the complete per-date masks; flood-change `GT` is never used.
+- No hidden tile cache or prepared-water directory is written.
+- `before`, `peak`, and `after` are each sampled once per spatial tile.
 
 ## Known limits
 
-- Current project PNG radiometry is not the same as GEOID's VV/VH dB normalization.
-- The repository example root contains no `WATER_GT_A/B` and cannot train this task.
-- No whole-scene or geospatial output path is included.
-- GEOID benchmark values are contextual references, not expected scores on current project data.
+- Real training requires the three precomputed SNAP Sigma0 GeoTIFFs; masks alone are insufficient.
+- The full warped mask arrays reside in memory.
+- Spatial split quality is constrained by one Kulsary event and should be evaluated with additional split seeds when reporting final performance.
+- Current metrics report water-class IoU, not two-class mean IoU.

@@ -1,16 +1,23 @@
 import argparse
 import datetime
 import json
+import math
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from tensorboardX import SummaryWriter
 
-from utils.parser import epoch_count, nonnegative_float, nonnegative_int, positive_int
-from water_seg.dataset import get_water_loaders
-from water_seg.engine import (build_optimizer, checkpoint_payload, run_epoch,
-                              save_checkpoint, seed_everything)
+from utils.parser import (epoch_count, finite_float, nonnegative_float,
+                          nonnegative_int, positive_int)
+from water_seg.dataset import (build_kulsary_scene_index,
+                               compute_train_vv_stats, get_water_loaders,
+                               grid_signature, resolve_sigma0_paths,
+                               source_fingerprints, tile_split_records)
+from water_seg.engine import (INPUT_CONTRACT, NORMALIZATION_CONTRACT,
+                              build_optimizer, checkpoint_payload,
+                              close_loader, run_epoch, save_checkpoint,
+                              seed_everything)
 from water_seg.model import SwinTinyUNet
 
 
@@ -19,12 +26,23 @@ GEOID_REFERENCE_COMMIT = 'b0ab63540a2a331513be306a5cbdc4ba88c766f5'
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description='Train a single-temporal VV Swin-T U-Net water segmenter'
+        description='Train a single-temporal Kulsary VV Swin-T U-Net'
     )
-    parser.add_argument('--dataset-dir', required=True)
+    parser.add_argument('--sigma0-root', type=Path, default=None)
+    parser.add_argument('--sigma0-before', type=Path, default=None)
+    parser.add_argument('--sigma0-peak', type=Path, default=None)
+    parser.add_argument('--sigma0-after', type=Path, default=None)
+    parser.add_argument('--mask-source', type=Path, required=True)
+    parser.add_argument('--db-min', type=finite_float, default=-25.0)
+    parser.add_argument('--db-max', type=finite_float, default=0.0)
+    parser.add_argument('--block-tiles', type=positive_int, default=2)
+    parser.add_argument('--train-ratio', type=finite_float, default=0.8)
+    parser.add_argument('--val-ratio', type=finite_float, default=0.1)
+    parser.add_argument('--test-ratio', type=finite_float, default=0.1)
+    parser.add_argument('--split-seed', type=int, default=42)
     parser.add_argument('--epochs', type=epoch_count, default=20)
     parser.add_argument('--batch-size', type=positive_int, default=8)
-    parser.add_argument('--num-workers', type=nonnegative_int, default=4)
+    parser.add_argument('--num-workers', type=nonnegative_int, default=0)
     parser.add_argument('--encoder-lr', type=nonnegative_float, default=5e-5)
     parser.add_argument('--decoder-lr', type=nonnegative_float, default=5e-4)
     parser.add_argument('--weight-decay', type=nonnegative_float, default=0.01)
@@ -44,9 +62,23 @@ def build_parser():
         '--imagenet-pretrained',
         action=argparse.BooleanOptionalAction,
         default=True,
-        help='initialize the Swin-T encoder from timm ImageNet weights',
+        help='initialize the one-channel Swin-T encoder from ImageNet weights',
     )
     return parser
+
+
+def _validate_data_options(options):
+    if options.db_min >= options.db_max:
+        raise ValueError('--db-min must be smaller than --db-max')
+    ratios = (
+        options.train_ratio,
+        options.val_ratio,
+        options.test_ratio,
+    )
+    if any(value <= 0 for value in ratios):
+        raise ValueError('split ratios must be positive')
+    if not math.isclose(sum(ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError('train/val/test ratios must sum to 1')
 
 
 def _resolve_device(requested):
@@ -55,9 +87,15 @@ def _resolve_device(requested):
     return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
-def _serializable_config(options):
+def _samples_per_split(index):
     return {
-        'dataset_dir': str(Path(options.dataset_dir).resolve()),
+        split: len(index.samples_for(split))
+        for split in ('train', 'val', 'test')
+    }
+
+
+def _serializable_config(options, index, vv_mean, vv_std, input_provenance):
+    return {
         'epochs': options.epochs,
         'batch_size': options.batch_size,
         'num_workers': options.num_workers,
@@ -71,7 +109,31 @@ def _serializable_config(options):
         'augmentation': options.augmentation,
         'imagenet_pretrained': options.imagenet_pretrained,
         'architecture': 'SwinTinyUNet',
-        'input': 'single VV channel, raw 0-255',
+        'input': INPUT_CONTRACT,
+        'in_chans': 1,
+        'normalization': NORMALIZATION_CONTRACT,
+        'vv_mean': float(vv_mean),
+        'vv_std': float(vv_std),
+        'db_min': index.db_min,
+        'db_max': index.db_max,
+        'sigma0_before': str(index.sigma0_paths['before']),
+        'sigma0_peak': str(index.sigma0_paths['peak']),
+        'sigma0_after': str(index.sigma0_paths['after']),
+        'sigma0_input_mode': input_provenance['input_mode'],
+        'sigma0_root': input_provenance['sigma0_root'],
+        'sigma0_manifest': input_provenance['sigma0_manifest'],
+        'sigma0_manifest_version': input_provenance['sigma0_manifest_version'],
+        'mask_source': str(index.mask_source),
+        'split_seed': index.split_seed,
+        'block_tiles': index.block_tiles,
+        'train_ratio': index.train_ratio,
+        'val_ratio': index.val_ratio,
+        'test_ratio': index.test_ratio,
+        'kept_tile_count': len(index.kept_tiles),
+        'samples_per_split': _samples_per_split(index),
+        'grid_signature': grid_signature(index.grid),
+        'tile_splits': tile_split_records(index),
+        'source_fingerprints': source_fingerprints(index),
         'decoder_channels': [512, 256, 128, 64],
         'num_classes': 2,
         'geoid_reference_commit': GEOID_REFERENCE_COMMIT,
@@ -99,16 +161,36 @@ def _print_epoch(epoch, train_metrics, val_metrics, optimizer):
 
 def main(argv=None):
     options = build_parser().parse_args(argv)
-    dataset_dir = str(Path(options.dataset_dir).resolve())
+    _validate_data_options(options)
     save_dir = Path(options.save_dir)
     seed_everything(options.seed)
     device = _resolve_device(options.device)
 
+    sigma0_paths, input_provenance = resolve_sigma0_paths(
+        sigma0_root=options.sigma0_root,
+        sigma0_before=options.sigma0_before,
+        sigma0_peak=options.sigma0_peak,
+        sigma0_after=options.sigma0_after,
+    )
+    index = build_kulsary_scene_index(
+        sigma0_paths['before'],
+        sigma0_paths['peak'],
+        sigma0_paths['after'],
+        options.mask_source,
+        db_min=options.db_min,
+        db_max=options.db_max,
+        block_tiles=options.block_tiles,
+        train_ratio=options.train_ratio,
+        val_ratio=options.val_ratio,
+        test_ratio=options.test_ratio,
+        split_seed=options.split_seed,
+    )
+    vv_mean, vv_std = compute_train_vv_stats(index)
     model = SwinTinyUNet(
         imagenet_pretrained=options.imagenet_pretrained,
-    ).to(device)
+    ).set_vv_normalization(vv_mean, vv_std).to(device)
     train_loader, val_loader = get_water_loaders(
-        dataset_dir,
+        index,
         batch_size=options.batch_size,
         num_workers=options.num_workers,
         augmentation=options.augmentation,
@@ -126,9 +208,24 @@ def main(argv=None):
         eta_min=options.eta_min,
     )
 
+    config = _serializable_config(
+        options,
+        index,
+        vv_mean,
+        vv_std,
+        input_provenance,
+    )
+    print(json.dumps({
+        'dataset': {
+            'kept_tiles': config['kept_tile_count'],
+            'samples_per_split': config['samples_per_split'],
+            'vv_mean': config['vv_mean'],
+            'vv_std': config['vv_std'],
+        }
+    }, sort_keys=True))
+
     timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     writer = SummaryWriter(str(save_dir / 'log' / timestamp))
-    config = _serializable_config(options)
     best_water_iou = float('-inf')
     best_epoch = None
     checks_without_improvement = 0
@@ -195,6 +292,8 @@ def main(argv=None):
                 break
     finally:
         writer.close()
+        close_loader(train_loader)
+        close_loader(val_loader)
 
     print(f'Training complete: {stop_reason}.')
     if best_epoch is not None:
