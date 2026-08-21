@@ -409,6 +409,28 @@ You can download our novel public S1GFloods dataset through the following link:
     --water-loss-weight 0.2
   ```
 
+- Standalone single-temporal water segmentation
+
+  A separate VV-only Swin-T + U-Net baseline is available under
+  [`water_seg/`](water_seg/README.md). It flattens labeled A and B dates into
+  independent samples and trains only against complete-water
+  `WATER_GT_A/WATER_GT_B` masks; the flood-change `GT` mask is never reused as
+  water supervision.
+
+  ```shell
+  uv run python -m water_seg.train \
+    --dataset-dir /path/to/merged
+
+  uv run python -m water_seg.eval \
+    --dataset-dir /path/to/merged \
+    --path .tmp/water_swin_tiny_unet/best.pth
+  ```
+
+  This baseline follows the GEOID-Flood Swin-T/U-Net protocol where it is
+  compatible with the current data, while retaining this repository's VV-only
+  labels and mask semantics. See the module README for the benchmark numbers,
+  compatibility limits, and offline initialization option.
+
 - Testing
 
   ```shell

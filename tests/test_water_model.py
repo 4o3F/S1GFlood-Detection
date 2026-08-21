@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import inspect
+import unittest
+from unittest.mock import patch
+
+import torch
+import torch.nn as nn
+
+from swin_transformer import swin
+from water_seg.model import DecoderBlock, SwinTinyEncoder, SwinTinyUNet
+
+
+class SwinTinyEncoderInitTest(unittest.TestCase):
+    def test_is_local_swin_subclass(self):
+        self.assertTrue(issubclass(SwinTinyEncoder, swin))
+        self.assertIsNot(SwinTinyEncoder.init_weights, swin.init_weights)
+
+    def test_init_weights_does_not_use_legacy_pretrained(self):
+        source = inspect.getsource(SwinTinyEncoder.init_weights)
+        self.assertNotIn('PRETRAINED', source)
+        self.assertNotIn('torch.load', source)
+
+    def test_construction_does_not_call_torch_load(self):
+        with patch('torch.load') as torch_load, patch(
+            'swin_transformer.torch.load'
+        ) as module_load:
+            encoder = SwinTinyEncoder()
+            torch_load.assert_not_called()
+            module_load.assert_not_called()
+        self.assertEqual(list(encoder.num_features), [96, 192, 384, 768])
+
+
+class SwinTinyUNetTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        with patch('torch.load') as torch_load:
+            cls.model = SwinTinyUNet(imagenet_pretrained=False).eval()
+            torch_load.assert_not_called()
+
+    def test_encoder_is_exposed_for_optimizer_grouping(self):
+        self.assertIsInstance(self.model.encoder, SwinTinyEncoder)
+        self.assertTrue(
+            any(name.startswith('encoder.') for name, _ in self.model.named_parameters())
+        )
+
+    def test_encoder_stage_channels(self):
+        features = self.model.encoder(torch.rand(1, 3, 64, 64))
+        self.assertEqual(len(features), 4)
+        for feature, channels, stride in zip(
+            features,
+            (96, 192, 384, 768),
+            (4, 8, 16, 32),
+        ):
+            self.assertEqual(tuple(feature.shape), (1, channels, 64 // stride, 64 // stride))
+
+    def test_forward_returns_full_resolution_logits(self):
+        image = torch.rand(1, 1, 64, 64) * 255
+        with torch.no_grad():
+            logits = self.model(image)
+        self.assertIsInstance(logits, torch.Tensor)
+        self.assertEqual(tuple(logits.shape), (1, 2, 64, 64))
+
+    def test_rejects_three_channel_input(self):
+        with self.assertRaises(ValueError):
+            self.model(torch.rand(1, 3, 64, 64))
+
+    def test_decoder_outputs_are_512_256_128_64(self):
+        self.assertEqual(self.model.dec1.out_channels, 512)
+        self.assertEqual(self.model.dec2.out_channels, 256)
+        self.assertEqual(self.model.dec3.out_channels, 128)
+        self.assertEqual(self.model.dec4.out_channels, 64)
+        self.assertIsInstance(self.model.dec1, DecoderBlock)
+        self.assertEqual(self.model.dec4.skip_channels, 0)
+
+        channels = []
+        hooks = [
+            block.register_forward_hook(
+                lambda module, inputs, output, bucket=channels: bucket.append(
+                    output.shape[1]
+                )
+            )
+            for block in (
+                self.model.dec1,
+                self.model.dec2,
+                self.model.dec3,
+                self.model.dec4,
+            )
+        ]
+        try:
+            with torch.no_grad():
+                self.model(torch.rand(1, 1, 64, 64) * 255)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        self.assertEqual(channels, [512, 256, 128, 64])
+
+    def test_state_dict_round_trip_reproduces_logits(self):
+        image = torch.rand(1, 1, 64, 64) * 255
+        with torch.no_grad():
+            original = self.model(image)
+        clone = SwinTinyUNet(imagenet_pretrained=False)
+        clone.load_state_dict(self.model.state_dict())
+        clone.eval()
+        with torch.no_grad():
+            restored = clone(image)
+        torch.testing.assert_close(restored, original)
+
+
+class ImageNetPretrainedLoadTest(unittest.TestCase):
+    def test_default_construction_does_not_create_timm_model(self):
+        with patch('timm.create_model') as create_model:
+            SwinTinyUNet(imagenet_pretrained=False)
+            create_model.assert_not_called()
+
+    def test_loads_matching_encoder_keys_from_timm_classification_model(self):
+        import timm
+
+        source = timm.create_model(
+            'swin_tiny_patch4_window7_224',
+            pretrained=False,
+            in_chans=3,
+        )
+        with patch('timm.create_model', return_value=source) as create_model:
+            model = SwinTinyUNet(imagenet_pretrained=True)
+        create_model.assert_called_once_with(
+            'swin_tiny_patch4_window7_224',
+            pretrained=True,
+            in_chans=3,
+        )
+        kwargs = create_model.call_args.kwargs
+        self.assertNotIn('features_only', kwargs)
+
+        source_state = source.state_dict()
+        loaded = model.encoder.state_dict()
+        torch.testing.assert_close(
+            loaded['patch_embed.proj.weight'],
+            source_state['patch_embed.proj.weight'],
+        )
+        torch.testing.assert_close(
+            loaded['layers.0.blocks.0.attn.qkv.weight'],
+            source_state['layers.0.blocks.0.attn.qkv.weight'],
+        )
+        self.assertIn('norm0.weight', loaded)
+        torch.testing.assert_close(
+            loaded['norm3.weight'],
+            source_state['norm.weight'],
+        )
+        torch.testing.assert_close(
+            loaded['norm3.bias'],
+            source_state['norm.bias'],
+        )
+        self.assertNotIn('head.weight', loaded)
+
+    def test_fails_when_too_few_tensors_match(self):
+        class TinySource(nn.Module):
+            def state_dict(self, *args, **kwargs):
+                return {
+                    'head.weight': torch.randn(1000, 768),
+                    'head.bias': torch.randn(1000),
+                    'norm.weight': torch.randn(768),
+                    'norm.bias': torch.randn(768),
+                    'layers.0.blocks.1.attn_mask': torch.zeros(64, 49, 49),
+                }
+
+        with patch('timm.create_model', return_value=TinySource()):
+            with self.assertRaises(RuntimeError) as raised:
+                SwinTinyUNet(imagenet_pretrained=True)
+        self.assertIn('matched 2 tensors', str(raised.exception))
+
+
+if __name__ == '__main__':
+    unittest.main()
