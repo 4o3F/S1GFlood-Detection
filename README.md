@@ -437,6 +437,22 @@ You can download our novel public S1GFloods dataset through the following link:
   memory, computes normalization from the train split only, and never runs
   SNAP in the DataLoader. See the module README for complete contracts.
 
+  Optional GEOID-Flood VV pretraining uses the release CSV directly and then
+  transfers weights into the Kulsary run:
+
+  ```shell
+  uv run python -m water_seg.pretrain_geoid \
+    --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
+
+  uv run python -m water_seg.train \
+    --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+    --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
+    --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth
+  ```
+
+  This adapter reads only `s1grd` band-1 VV and `label` windows referenced by
+  `data_tiles_s256_st128.csv`; other GEOID modalities are not required.
+
 - Testing
 
   ```shell

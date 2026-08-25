@@ -49,8 +49,22 @@ def _safe_divide(numerator, denominator):
     return numerator / denominator if denominator else 0.0
 
 
-def _batch_confusion(targets, predictions):
-    encoded = targets.reshape(-1) * 2 + predictions.reshape(-1)
+def _batch_confusion(targets, predictions, ignore_index=None):
+    flat_targets = targets.reshape(-1)
+    flat_predictions = predictions.reshape(-1)
+    if flat_targets.shape != flat_predictions.shape:
+        raise ValueError('target and prediction shapes must match')
+    if ignore_index is not None:
+        valid = flat_targets != ignore_index
+        flat_targets = flat_targets[valid]
+        flat_predictions = flat_predictions[valid]
+    if flat_targets.numel() == 0:
+        return np.zeros((2, 2), dtype=np.int64)
+    if not bool(((flat_targets == 0) | (flat_targets == 1)).all()):
+        raise ValueError('water targets must contain only 0, 1, or ignore_index')
+    if not bool(((flat_predictions == 0) | (flat_predictions == 1)).all()):
+        raise ValueError('water predictions must contain only classes 0 and 1')
+    encoded = flat_targets * 2 + flat_predictions
     counts = torch.bincount(encoded, minlength=4)
     return counts.reshape(2, 2).detach().cpu().numpy().astype(np.int64)
 
@@ -77,6 +91,8 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     confusion = np.zeros((2, 2), dtype=np.int64)
     loss_sum = 0.0
     sample_count = 0
+    valid_pixel_count = 0
+    ignore_index = getattr(criterion, 'ignore_index', None)
 
     with torch.set_grad_enabled(training):
         for images, targets, _ in loader:
@@ -95,10 +111,20 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             batch_size = targets.size(0)
             sample_count += batch_size
             loss_sum += loss.item() * batch_size
-            confusion += _batch_confusion(targets, predictions)
+            if ignore_index is None:
+                valid_pixel_count += targets.numel()
+            else:
+                valid_pixel_count += int((targets != ignore_index).sum().item())
+            confusion += _batch_confusion(
+                targets,
+                predictions,
+                ignore_index=ignore_index,
+            )
 
     if sample_count == 0:
         raise ValueError('water segmentation loader is empty')
+    if valid_pixel_count == 0:
+        raise ValueError('water segmentation loader has no supervised pixels')
 
     metrics = metrics_from_confusion(confusion)
     metrics['loss'] = loss_sum / sample_count
@@ -304,4 +330,60 @@ def load_model_checkpoint(
             raise ValueError('checkpoint vv_mean disagrees with model state')
         if not np.isclose(model_std, float(config['vv_std'])):
             raise ValueError('checkpoint vv_std disagrees with model state')
+    return checkpoint
+
+
+def load_initial_model_weights(
+    path,
+    model,
+    map_location='cpu',
+    expected_architecture=None,
+):
+    """Load a compatible GEOID pretraining or Kulsary model state.
+
+    This deliberately restores model tensors only. The caller must set the
+    target dataset's VV normalization after loading.
+    """
+    checkpoint = torch.load(
+        Path(path),
+        map_location=map_location,
+        weights_only=True,
+    )
+    if not isinstance(checkpoint, dict):
+        raise ValueError('initialization checkpoint must be a dictionary')
+    required = {'model_state_dict', 'config'}
+    missing = sorted(required - checkpoint.keys())
+    if missing:
+        raise ValueError(
+            f'initialization checkpoint is missing required keys: {missing}'
+        )
+
+    config = checkpoint['config']
+    if not isinstance(config, dict):
+        raise ValueError('initialization checkpoint config must be a dictionary')
+    if checkpoint.get('kind') == 'geoid-water-pretraining':
+        if checkpoint.get('format_version') != 1:
+            raise ValueError('unsupported GEOID pretraining checkpoint format')
+        for key, expected in (
+            ('input', INPUT_CONTRACT),
+            ('normalization', NORMALIZATION_CONTRACT),
+            ('in_chans', 1),
+        ):
+            if config.get(key) != expected:
+                raise ValueError(
+                    f'GEOID pretraining checkpoint has incompatible {key}'
+                )
+    else:
+        if checkpoint.get('format_version') != CHECKPOINT_FORMAT_VERSION:
+            raise ValueError('unsupported initialization checkpoint format')
+        _validate_checkpoint_config(config, expected_architecture)
+
+    if expected_architecture is not None:
+        architecture = config.get('architecture')
+        if architecture != expected_architecture:
+            raise ValueError(
+                f'checkpoint architecture must be {expected_architecture}, '
+                f'got {architecture}'
+            )
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     return checkpoint

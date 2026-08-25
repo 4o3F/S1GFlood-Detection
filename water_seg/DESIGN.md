@@ -2,7 +2,7 @@
 
 ## Goal
 
-Optimize single-temporal water segmentation for the Kulsary target domain through a reproducible two-stage boundary: restored GRD SAFE products are first published as a stable three-file Sigma0 dataset, then training reads only that dataset and the original full-water masks. This eliminates prepared-pair peak duplication, uint8 quantization, and RGB ImageNet normalization without changing the legacy DAM-Net pipeline.
+Optimize single-temporal water segmentation for the Kulsary target domain through a reproducible target-data boundary, with optional source-domain pretraining on GEOID-Flood. Restored Kulsary GRD SAFE products are first published as a stable three-file Sigma0 dataset, then target training reads only that dataset and the original full-water masks. This eliminates prepared-pair peak duplication, uint8 quantization, and RGB ImageNet normalization without changing the legacy DAM-Net pipeline.
 
 ## Boundaries
 
@@ -12,12 +12,33 @@ prepare_kulsary_sigma0.py -> parent-only SNAP/cache and atomic Sigma0 publish
 utils.kulsary_raster      -> common grid, raster windows, mask warp, tile validity
 utils.kulsary_temporal    -> dates, spatial split, unique role samples
 water_seg.dataset         -> Sigma0-root validation, scene index, stats, loaders
+water_seg.geoid_dataset   -> official GEOID CSV windows and label remapping
 water_seg.model           -> one-channel Swin-T encoder and U-Net decoder
 water_seg.engine          -> metrics, optimizer, checkpoint format 2
-water_seg.train/eval      -> Sigma0-only training/evaluation CLIs
+water_seg.pretrain_geoid  -> GEOID source-domain pretraining CLI
+water_seg.train/eval      -> Kulsary Sigma0 training/evaluation CLIs
 ```
 
 Training accepts a canonical precomputed Sigma0 root or three explicit GeoTIFFs. SAFE discovery and SNAP execution are confined to the standalone preprocessing script; DataLoader workers cannot reach them.
+
+GEOID pretraining is a separate chain. It accepts the official
+`data_tiles_s256_st128.csv`, lazily reads S1-GRD VV windows and labels, and emits
+a transfer checkpoint. Kulsary training may restore its model tensors through
+`--init-checkpoint`, then overwrites VV normalization with Kulsary train-split
+statistics and creates a fresh optimizer/scheduler. Joint source/target batches
+are intentionally not supported.
+
+## GEOID label and raster contract
+
+GEOID raw classes are background 0, permanent water 1, flood 2, and ignore
+255. The complete-water remap is `{0:0,1:1,2:0}` for pre-event imagery and
+`{0:0,1:1,2:1}` for post-event imagery. Ignore-label and invalid/nonpositive VV
+pixels remain ignored in loss and confusion metrics. The index keeps only
+official train/val S1-GRD rows with at least 1% valid label coverage.
+
+Only band 1 VV is read. Each metadata row contributes its `(x,y,256,256)`
+window; overlapping train windows and non-overlapping validation windows remain
+as published. No prepared GEOID tile cache is written.
 
 ## Stage-one SAFE publication
 
@@ -99,3 +120,5 @@ Evaluation rebuilds the index with checkpoint paths or explicit relocation paths
 - The full warped mask arrays reside in memory.
 - Spatial split quality is constrained by one Kulsary event and should be evaluated with additional split seeds when reporting final performance.
 - Current metrics report water-class IoU, not two-class mean IoU.
+- GEOID pretraining scans valid training windows once to compute clipped-dB VV
+  statistics before the first epoch.

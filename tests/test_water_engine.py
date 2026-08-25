@@ -10,9 +10,9 @@ from torch.utils.data import DataLoader
 
 from water_seg.engine import (CHECKPOINT_FORMAT_VERSION, INPUT_CONTRACT,
                               NORMALIZATION_CONTRACT, build_optimizer,
-                              checkpoint_payload, load_model_checkpoint,
-                              metrics_from_confusion, run_epoch,
-                              save_checkpoint)
+                              checkpoint_payload, load_initial_model_weights,
+                              load_model_checkpoint, metrics_from_confusion,
+                              run_epoch, save_checkpoint)
 
 
 class TinyWaterModel(nn.Module):
@@ -173,6 +173,24 @@ class WaterEngineTest(unittest.TestCase):
         self.assertLessEqual(metrics['water_iou'], 1.0)
         self.assertFalse(torch.equal(before, self.model.head.weight.detach()))
 
+    def test_epoch_excludes_ignore_index_from_metrics(self):
+        images = torch.tensor([[[[0.0, 1.0], [1.0, 0.0]]]])
+        targets = torch.tensor([[[0, 1], [255, 0]]])
+        loader = DataLoader(
+            [(images[0], targets[0], 'geoid-sample')],
+            batch_size=1,
+            shuffle=False,
+        )
+        metrics = run_epoch(
+            self.model,
+            loader,
+            nn.CrossEntropyLoss(ignore_index=255),
+            torch.device('cpu'),
+        )
+        self.assertEqual(metrics['samples'], 1)
+        self.assertGreaterEqual(metrics['overall_accuracy'], 0.0)
+        self.assertLessEqual(metrics['overall_accuracy'], 1.0)
+
     def test_checkpoint_round_trip_restores_model_state(self):
         expected = {
             name: value.detach().clone()
@@ -243,6 +261,39 @@ class WaterEngineTest(unittest.TestCase):
                     torch.save(payload, path)
                     with self.assertRaisesRegex(ValueError, message):
                         load_model_checkpoint(path, self.model)
+
+    def test_geoid_pretraining_checkpoint_loads_model_weights_only(self):
+        expected = {
+            name: value.detach().clone()
+            for name, value in self.model.state_dict().items()
+        }
+        payload = {
+            'kind': 'geoid-water-pretraining',
+            'format_version': 1,
+            'epoch': 2,
+            'model_state_dict': self.model.state_dict(),
+            'config': {
+                'architecture': 'tiny',
+                'input': INPUT_CONTRACT,
+                'normalization': NORMALIZATION_CONTRACT,
+                'in_chans': 1,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'geoid.pth'
+            torch.save(payload, path)
+            with torch.no_grad():
+                for parameter in self.model.parameters():
+                    parameter.zero_()
+            loaded = load_initial_model_weights(
+                path,
+                self.model,
+                expected_architecture='tiny',
+            )
+
+        self.assertEqual(loaded['kind'], 'geoid-water-pretraining')
+        for name, value in self.model.state_dict().items():
+            torch.testing.assert_close(value, expected[name])
 
 
 if __name__ == '__main__':

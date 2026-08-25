@@ -1,4 +1,59 @@
-# Kulsary Single-Temporal VV Water Segmentation
+# Single-Temporal VV Water Segmentation
+
+The target workflow remains Kulsary-only training/evaluation. An optional
+GEOID-Flood stage provides source-domain pretraining before Kulsary fine-tuning.
+The two datasets keep separate loaders and checkpoints so their label, split,
+and normalization provenance cannot be mixed accidentally.
+
+## Optional GEOID-Flood pretraining
+
+Point the pretraining command directly at the directory that contains
+`data_tiles_s256_st128.csv`, `tile_catalog.parquet`, and the `EMSR*` folders:
+
+```shell
+uv run python -m water_seg.pretrain_geoid \
+  --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
+  --validate-only
+
+uv run python -m water_seg.pretrain_geoid \
+  --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
+  --batch-size 8 \
+  --num-workers 4
+```
+
+This is not compatible with the Kulsary DataLoader. The GEOID adapter reads
+each official CSV row as a window into:
+
+```text
+geoid-flood/<EMSR-event-AoI>/s1grd/<tile_id>.tif
+geoid-flood/<EMSR-event-AoI>/label/<label_id>.tif
+```
+
+Only S1-GRD band 1 (VV), `train`/`val` rows, and `pre`/`post` images are used.
+The adapter does not read `s2l2a`, `s1rtc`, `dem`, `cloudmask`, or
+`tile_catalog.parquet`, and it does not create another tiled dataset. A partial
+download is therefore valid if the CSV plus every referenced `s1grd` and
+`label` file is present.
+
+GEOID labels use `0=background`, `1=permanent water`, `2=flood`, and
+`255=ignore`. For a single-temporal complete-water target, class 2 maps to
+background on `pre` images and to water on `post` images; 255 and invalid VV
+pixels are excluded from both cross-entropy and metrics. VV uses the same
+linear-Sigma0 to clipped `[-25,0]` dB contract as Kulsary, with normalization
+statistics computed from valid GEOID training pixels only. The official
+256-pixel windows are retained instead of resized to 224.
+
+Fine-tune the resulting model on Kulsary:
+
+```shell
+uv run python -m water_seg.train \
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
+  --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth
+```
+
+`--init-checkpoint` restores model weights only. Kulsary train-split VV
+normalization is then applied, and optimizer/scheduler state starts fresh.
 
 The Kulsary workflow has two explicit stages:
 
