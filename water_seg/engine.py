@@ -4,6 +4,7 @@ import random
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 
 CHECKPOINT_FORMAT_VERSION = 2
@@ -85,7 +86,14 @@ def metrics_from_confusion(confusion):
     }
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None):
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    optimizer=None,
+    progress_description=None,
+):
     training = optimizer is not None
     model.train(training)
     confusion = np.zeros((2, 2), dtype=np.int64)
@@ -94,8 +102,16 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     valid_pixel_count = 0
     ignore_index = getattr(criterion, 'ignore_index', None)
 
+    batches = tqdm(
+        loader,
+        desc=progress_description,
+        unit='batch',
+        dynamic_ncols=True,
+        leave=False,
+        disable=progress_description is None,
+    )
     with torch.set_grad_enabled(training):
-        for images, targets, _ in loader:
+        for images, targets, _ in batches:
             images = images.float().to(device, non_blocking=True)
             targets = targets.long().to(device, non_blocking=True)
 
@@ -111,6 +127,8 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
             batch_size = targets.size(0)
             sample_count += batch_size
             loss_sum += loss.item() * batch_size
+            if progress_description is not None:
+                batches.set_postfix(loss=f'{loss.item():.4f}')
             if ignore_index is None:
                 valid_pixel_count += targets.numel()
             else:

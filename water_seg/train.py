@@ -63,6 +63,12 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        '--progress',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='show train and validation batch progress bars',
+    )
+    parser.add_argument(
         '--augmentation',
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -124,6 +130,7 @@ def _serializable_config(
         'min_iou_improvement': options.min_iou_improvement,
         'seed': options.seed,
         'augmentation': options.augmentation,
+        'progress': options.progress,
         'imagenet_pretrained': (
             options.imagenet_pretrained and options.init_checkpoint is None
         ),
@@ -285,12 +292,20 @@ def main(argv=None):
                 criterion,
                 device,
                 optimizer=optimizer,
+                progress_description=(
+                    f'Kulsary train {epoch}/{options.epochs}'
+                    if options.progress else None
+                ),
             )
             val_metrics = run_epoch(
                 model,
                 val_loader,
                 criterion,
                 device,
+                progress_description=(
+                    f'Kulsary val {epoch}/{options.epochs}'
+                    if options.progress else None
+                ),
             )
             _write_metrics(writer, 'train', train_metrics, epoch)
             _write_metrics(writer, 'val', val_metrics, epoch)

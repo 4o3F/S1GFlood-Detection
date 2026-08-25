@@ -73,7 +73,7 @@ class GEOIDPretrainCliTest(unittest.TestCase):
                 'water_seg.pretrain_geoid.build_geoid_water_index',
                 return_value=index,
             ), patch(
-                'water_seg.pretrain_geoid.compute_geoid_train_vv_stats',
+                'water_seg.pretrain_geoid._load_geoid_vv_constants',
                 return_value=(-15.0, 5.0),
             ), patch(
                 'water_seg.pretrain_geoid.SwinTinyUNet',
@@ -92,6 +92,7 @@ class GEOIDPretrainCliTest(unittest.TestCase):
                     '--device', 'cpu',
                     '--no-imagenet-pretrained',
                     '--no-augmentation',
+                    '--no-progress',
                     '--early-stopping-patience', '0',
                     '--save-dir', str(save_dir),
                 ])

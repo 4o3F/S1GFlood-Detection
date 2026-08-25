@@ -441,6 +441,9 @@ You can download our novel public S1GFloods dataset through the following link:
   transfers weights into the Kulsary run:
 
   ```shell
+  uv run python -m water_seg.compute_geoid_stats \
+    --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
+
   uv run python -m water_seg.pretrain_geoid \
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
 

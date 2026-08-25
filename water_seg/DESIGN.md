@@ -13,6 +13,8 @@ utils.kulsary_raster      -> common grid, raster windows, mask warp, tile validi
 utils.kulsary_temporal    -> dates, spatial split, unique role samples
 water_seg.dataset         -> Sigma0-root validation, scene index, stats, loaders
 water_seg.geoid_dataset   -> official GEOID CSV windows and label remapping
+water_seg.compute_geoid_stats -> one-time VV statistics constant generator
+water_seg.geoid_stats     -> generated GEOID normalization and provenance
 water_seg.model           -> one-channel Swin-T encoder and U-Net decoder
 water_seg.engine          -> metrics, optimizer, checkpoint format 2
 water_seg.pretrain_geoid  -> GEOID source-domain pretraining CLI
@@ -27,6 +29,13 @@ a transfer checkpoint. Kulsary training may restore its model tensors through
 `--init-checkpoint`, then overwrites VV normalization with Kulsary train-split
 statistics and creates a fresh optimizer/scheduler. Joint source/target batches
 are intentionally not supported.
+
+Before the first pretraining run, `compute_geoid_stats` scans the selected
+training coverage once. It groups overlapping windows by source raster, derives
+their exact coverage weights, and writes mean/std plus selection provenance to
+`geoid_stats.py`. The pretraining entry point performs no statistics scan and
+refuses constants whose metadata fingerprint, dB range, validity threshold, or
+train sample count differs from the current index.
 
 ## GEOID label and raster contract
 
@@ -120,5 +129,5 @@ Evaluation rebuilds the index with checkpoint paths or explicit relocation paths
 - The full warped mask arrays reside in memory.
 - Spatial split quality is constrained by one Kulsary event and should be evaluated with additional split seeds when reporting final performance.
 - Current metrics report water-class IoU, not two-class mean IoU.
-- GEOID pretraining scans valid training windows once to compute clipped-dB VV
-  statistics before the first epoch.
+- GEOID VV constants must be regenerated explicitly when its metadata or
+  radiometry selection changes.

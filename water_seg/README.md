@@ -15,11 +15,23 @@ uv run python -m water_seg.pretrain_geoid \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --validate-only
 
+uv run python -m water_seg.compute_geoid_stats \
+  --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
+
 uv run python -m water_seg.pretrain_geoid \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --batch-size 8 \
   --num-workers 4
 ```
+
+`compute_geoid_stats` is a one-time offline pass. It displays source-level
+progress, computes the exact train-window-weighted VV mean/std, and atomically
+replaces `water_seg/geoid_stats.py` with Python constants plus the metadata
+fingerprint, dB range, validity threshold, and train sample count. Pretraining
+never scans the imagery for statistics; it reads those constants and rejects
+them if their provenance does not match the current CSV selection. Regenerate
+the constants only after changing the dataset metadata, `--db-min`, `--db-max`,
+or `--min-valid-proportion`.
 
 This is not compatible with the Kulsary DataLoader. The GEOID adapter reads
 each official CSV row as a window into:
@@ -42,6 +54,10 @@ pixels are excluded from both cross-entropy and metrics. VV uses the same
 linear-Sigma0 to clipped `[-25,0]` dB contract as Kulsary, with normalization
 statistics computed from valid GEOID training pixels only. The official
 256-pixel windows are retained instead of resized to 224.
+
+Pretraining and fine-tuning remain epoch-based and validate after every epoch.
+Their train/validation loops display batch progress and current loss by default;
+use `--no-progress` only for non-interactive logging.
 
 Fine-tune the resulting model on Kulsary:
 

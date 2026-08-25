@@ -20,9 +20,9 @@ from water_seg.geoid_dataset import (GEOID_IGNORE_INDEX,
                                      GEOID_PRETRAINING_FORMAT_VERSION,
                                      GEOID_PRETRAINING_KIND,
                                      build_geoid_water_index,
-                                     compute_geoid_train_vv_stats,
                                      get_geoid_water_loaders,
                                      validate_geoid_files)
+from water_seg.geoid_stats import GEOID_VV_STATS
 from water_seg.model import SwinTinyUNet
 
 
@@ -73,6 +73,12 @@ def build_parser():
         help='validate CSV selection and referenced files without training',
     )
     parser.add_argument(
+        '--progress',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='show source and batch progress bars',
+    )
+    parser.add_argument(
         '--augmentation',
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -100,6 +106,48 @@ def _resolve_device(requested):
     return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
+def _load_geoid_vv_constants(index):
+    stats = GEOID_VV_STATS
+    if not isinstance(stats, dict):
+        raise RuntimeError(
+            'GEOID VV constants are not generated; run '
+            '`python -m water_seg.compute_geoid_stats --geoid-root PATH` first'
+        )
+    required = {
+        'vv_mean',
+        'vv_std',
+        'db_min',
+        'db_max',
+        'min_valid_proportion',
+        'train_samples',
+        'metadata_fingerprint',
+    }
+    missing = sorted(required - stats.keys())
+    if missing:
+        raise ValueError(f'GEOID VV constants are missing fields: {missing}')
+    counts = index.counts()
+    expected = {
+        'db_min': index.db_min,
+        'db_max': index.db_max,
+        'min_valid_proportion': index.min_valid_proportion,
+        'train_samples': counts['train'],
+        'metadata_fingerprint': sampled_file_fingerprint(index.metadata_path),
+    }
+    for key, expected_value in expected.items():
+        if stats[key] != expected_value:
+            raise ValueError(
+                f'GEOID VV constants do not match current {key}; regenerate '
+                'them with water_seg.compute_geoid_stats'
+            )
+    vv_mean = float(stats['vv_mean'])
+    vv_std = float(stats['vv_std'])
+    if not math.isfinite(vv_mean):
+        raise ValueError('GEOID VV mean constant must be finite')
+    if not math.isfinite(vv_std) or vv_std <= 0:
+        raise ValueError('GEOID VV std constant must be finite and positive')
+    return vv_mean, vv_std
+
+
 def _serializable_config(options, index, vv_mean, vv_std, file_inventory):
     counts = index.counts()
     return {
@@ -114,6 +162,7 @@ def _serializable_config(options, index, vv_mean, vv_std, file_inventory):
         'min_iou_improvement': options.min_iou_improvement,
         'seed': options.seed,
         'augmentation': options.augmentation,
+        'progress': options.progress,
         'imagenet_pretrained': options.imagenet_pretrained,
         'architecture': 'SwinTinyUNet',
         'input': INPUT_CONTRACT,
@@ -223,7 +272,7 @@ def main(argv=None):
     if options.validate_only:
         print('GEOID S1-GRD/label selection is complete.')
         return None
-    vv_mean, vv_std = compute_geoid_train_vv_stats(index)
+    vv_mean, vv_std = _load_geoid_vv_constants(index)
     model = SwinTinyUNet(
         imagenet_pretrained=options.imagenet_pretrained,
     ).set_vv_normalization(vv_mean, vv_std).to(device)
@@ -275,12 +324,20 @@ def main(argv=None):
                 criterion,
                 device,
                 optimizer=optimizer,
+                progress_description=(
+                    f'GEOID train {epoch}/{options.epochs}'
+                    if options.progress else None
+                ),
             )
             val_metrics = run_epoch(
                 model,
                 val_loader,
                 criterion,
                 device,
+                progress_description=(
+                    f'GEOID val {epoch}/{options.epochs}'
+                    if options.progress else None
+                ),
             )
             _write_metrics(writer, 'train', train_metrics, epoch)
             _write_metrics(writer, 'val', val_metrics, epoch)

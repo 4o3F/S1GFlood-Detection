@@ -130,7 +130,7 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
     def test_stats_and_loaders_use_only_supervised_pixels(self):
         with tempfile.TemporaryDirectory() as directory:
             index = build_geoid_water_index(self._build_tree(directory))
-            mean, std = compute_geoid_train_vv_stats(index)
+            mean, std = compute_geoid_train_vv_stats(index, progress=False)
             train_loader, val_loader = get_geoid_water_loaders(
                 index,
                 batch_size=2,
@@ -146,6 +146,54 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
         self.assertEqual(len(names), 2)
         self.assertTrue(bool((masks == GEOID_IGNORE_INDEX).any()))
         self.assertEqual(len(val_loader.dataset), 1)
+
+    def test_grouped_stats_preserve_overlapping_window_weighting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(directory)
+            event = root / 'EMSR100-1'
+            sigma0 = np.full((2, 256, 384), 0.01, dtype=np.float32)
+            sigma0[0, :, 128:256] = 10 ** -1.5
+            sigma0[0, :, 256:] = 0.1
+            label = np.zeros((256, 384), dtype=np.uint8)
+            _write_raster(
+                event / 'label' / 'EMSR100-1-2_label.tif',
+                label,
+            )
+            for image_path in (event / 's1grd').glob('*.tif'):
+                _write_raster(image_path, sigma0)
+
+            metadata_path = root / 'data_tiles_s256_st128.csv'
+            with metadata_path.open(
+                'r',
+                encoding='utf-8',
+                newline='',
+            ) as stream:
+                rows = list(csv.DictReader(stream))
+            overlap = dict(rows[0])
+            overlap['x'] = 128
+            rows.append(overlap)
+            with metadata_path.open(
+                'w',
+                encoding='utf-8',
+                newline='',
+            ) as stream:
+                writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            index = build_geoid_water_index(root)
+            mean, std = compute_geoid_train_vv_stats(index, progress=False)
+            dataset = GEOIDRawWaterDataset(index, 'train')
+            values = torch.cat([
+                image.squeeze(0)[mask != GEOID_IGNORE_INDEX]
+                for image, mask, _ in (
+                    dataset[sample_index]
+                    for sample_index in range(len(dataset))
+                )
+            ])
+
+        self.assertAlmostEqual(mean, float(values.mean()), places=5)
+        self.assertAlmostEqual(std, float(values.std(correction=0)), places=5)
 
     def test_invalid_raw_label_value_is_rejected_at_read_time(self):
         with tempfile.TemporaryDirectory() as directory:

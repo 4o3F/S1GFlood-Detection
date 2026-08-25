@@ -8,10 +8,10 @@ import rasterio
 from rasterio.windows import Window
 import torch
 import torch.utils.data as data
+from tqdm import tqdm
 
 from utils.kulsary_raster import PATCH_SIZE
-from water_seg.dataset import (_validate_db_range, _water_loader,
-                               _welford_combine, RandomD4)
+from water_seg.dataset import _validate_db_range, _water_loader, RandomD4
 
 
 GEOID_METADATA_FILENAME = 'data_tiles_s256_st128.csv'
@@ -328,26 +328,111 @@ def _read_geoid_arrays(sample, db_min, db_max):
     return image, mask
 
 
-def compute_geoid_train_vv_stats(index):
-    """Population VV dB statistics over valid train pixels only."""
+def compute_geoid_train_vv_stats(index, progress=True):
+    """Population VV dB statistics over valid train-window pixels.
+
+    GEOID training windows overlap. Grouping by source image and using a 2-D
+    coverage accumulator preserves the exact per-window pixel weighting while
+    opening each source image only once.
+    """
     samples = index.samples_for('train')
     if not samples:
         raise ValueError('no GEOID training samples are available for VV stats')
+
+    samples_by_source = {}
+    for sample in samples:
+        key = (sample.image_path, sample.label_path)
+        samples_by_source.setdefault(key, []).append(sample)
+
     count = 0
     mean = 0.0
     second_moment = 0.0
-    for sample in samples:
-        image, mask = _read_geoid_arrays(
-            sample,
-            index.db_min,
-            index.db_max,
+    iterator = tqdm(
+        samples_by_source.items(),
+        total=len(samples_by_source),
+        desc='GEOID VV statistics',
+        unit='source',
+        dynamic_ncols=True,
+        disable=not progress,
+    )
+    for (image_path, label_path), source_samples in iterator:
+        if not image_path.is_file():
+            raise FileNotFoundError(f'GEOID S1-GRD image is missing: {image_path}')
+        if not label_path.is_file():
+            raise FileNotFoundError(f'GEOID label is missing: {label_path}')
+        with rasterio.open(image_path) as image_source:
+            if image_source.count < 1:
+                raise ValueError(f'GEOID image has no VV band: {image_path}')
+            sigma0 = image_source.read(1, out_dtype='float32')
+        with rasterio.open(label_path) as label_source:
+            if label_source.count < 1:
+                raise ValueError(f'GEOID label has no band: {label_path}')
+            raw_mask = label_source.read(1)
+        if sigma0.shape != raw_mask.shape:
+            raise ValueError(
+                f'GEOID image/label shape mismatch: {image_path} and {label_path}'
+            )
+
+        height, width = sigma0.shape
+        coverage_delta = np.zeros(
+            (height + 1, width + 1),
+            dtype=np.int32,
         )
-        count, mean, second_moment = _welford_combine(
-            count,
-            mean,
-            second_moment,
-            image[mask != GEOID_IGNORE_INDEX],
+        for sample in source_samples:
+            x0 = sample.x
+            y0 = sample.y
+            x1 = x0 + sample.size
+            y1 = y0 + sample.size
+            if x1 > width or y1 > height:
+                raise ValueError(
+                    f'GEOID image window is out of bounds: {sample.name}'
+                )
+            coverage_delta[y0, x0] += 1
+            coverage_delta[y1, x0] -= 1
+            coverage_delta[y0, x1] -= 1
+            coverage_delta[y1, x1] += 1
+        coverage = coverage_delta.cumsum(axis=0).cumsum(axis=1)[:-1, :-1]
+        selected = coverage > 0
+        raw_values = set(np.unique(raw_mask[selected]).tolist())
+        unexpected = sorted(raw_values - {0, 1, 2, GEOID_IGNORE_INDEX})
+        if unexpected:
+            raise ValueError(
+                f'GEOID label has unsupported values {unexpected}: {label_path}'
+            )
+
+        valid = (
+            selected
+            & (raw_mask != GEOID_IGNORE_INDEX)
+            & np.isfinite(sigma0)
+            & (sigma0 > 0)
+            & (sigma0 <= 1e3)
         )
+        if not bool(valid.any()):
+            continue
+        values = np.clip(
+            np.float32(10.0) * np.log10(sigma0[valid]),
+            np.float32(index.db_min),
+            np.float32(index.db_max),
+        ).astype(np.float64, copy=False)
+        weights = coverage[valid].astype(np.float64, copy=False)
+        batch_count = int(weights.sum())
+        batch_mean = float(np.dot(weights, values) / batch_count)
+        batch_second = float(
+            np.dot(weights, np.square(values - batch_mean))
+        )
+        if count == 0:
+            count = batch_count
+            mean = batch_mean
+            second_moment = batch_second
+        else:
+            delta = batch_mean - mean
+            total = count + batch_count
+            mean += delta * batch_count / total
+            second_moment += (
+                batch_second
+                + (delta * delta) * count * batch_count / total
+            )
+            count = total
     if count <= 0:
         raise ValueError('GEOID training VV stats received no valid pixels')
     std = math.sqrt(second_moment / count)
