@@ -13,8 +13,11 @@ from utils.parser import (epoch_count, finite_float, nonnegative_float,
                           nonnegative_int, positive_int)
 from water_seg.engine import (INPUT_CONTRACT, NORMALIZATION_CONTRACT,
                               build_optimizer, checkpoint_payload,
-                              close_loader, run_epoch, save_checkpoint,
-                              seed_everything)
+                              cleanup_distributed, close_loader,
+                              initialize_distributed, run_epoch,
+                              save_checkpoint, seed_everything,
+                              set_loader_epoch, synchronize_model_buffers,
+                              unwrap_model, wrap_distributed_model)
 from water_seg.geoid_dataset import (GEOID_IGNORE_INDEX,
                                      GEOID_METADATA_FILENAME,
                                      GEOID_PRETRAINING_FORMAT_VERSION,
@@ -100,12 +103,6 @@ def _validate_options(options):
         raise ValueError('--min-valid-proportion must be between 0 and 1')
 
 
-def _resolve_device(requested):
-    if requested:
-        return torch.device(requested)
-    return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-
 def _load_geoid_vv_constants(index):
     stats = GEOID_VV_STATS
     if not isinstance(stats, dict):
@@ -148,11 +145,24 @@ def _load_geoid_vv_constants(index):
     return vv_mean, vv_std
 
 
-def _serializable_config(options, index, vv_mean, vv_std, file_inventory):
+def _serializable_config(
+    options,
+    index,
+    vv_mean,
+    vv_std,
+    file_inventory,
+    distributed_context,
+):
     counts = index.counts()
     return {
         'epochs': options.epochs,
         'batch_size': options.batch_size,
+        'batch_size_per_rank': options.batch_size,
+        'global_batch_size': (
+            options.batch_size * distributed_context.world_size
+        ),
+        'distributed': distributed_context.distributed,
+        'world_size': distributed_context.world_size,
         'num_workers': options.num_workers,
         'encoder_lr': options.encoder_lr,
         'decoder_lr': options.decoder_lr,
@@ -242,12 +252,11 @@ def _pretraining_payload(
     return payload
 
 
-def main(argv=None):
-    options = build_parser().parse_args(argv)
+def _run(options, distributed_context):
     _validate_options(options)
     save_dir = Path(options.save_dir)
-    seed_everything(options.seed)
-    device = _resolve_device(options.device)
+    seed_everything(options.seed + distributed_context.rank)
+    device = distributed_context.device
 
     index = build_geoid_water_index(
         options.geoid_root,
@@ -258,29 +267,35 @@ def main(argv=None):
     )
     file_inventory = validate_geoid_files(index)
     counts = index.counts()
-    print(json.dumps({'geoid_index': {
-        'samples_per_split': {
-            'train': counts['train'],
-            'val': counts['val'],
-        },
-        'samples_per_time': {
-            'pre': counts['pre'],
-            'post': counts['post'],
-        },
-        **file_inventory,
-    }}, sort_keys=True))
+    if distributed_context.is_main:
+        print(json.dumps({'geoid_index': {
+            'samples_per_split': {
+                'train': counts['train'],
+                'val': counts['val'],
+            },
+            'samples_per_time': {
+                'pre': counts['pre'],
+                'post': counts['post'],
+            },
+            **file_inventory,
+        }}, sort_keys=True))
     if options.validate_only:
-        print('GEOID S1-GRD/label selection is complete.')
+        if distributed_context.is_main:
+            print('GEOID S1-GRD/label selection is complete.')
         return None
     vv_mean, vv_std = _load_geoid_vv_constants(index)
     model = SwinTinyUNet(
-        imagenet_pretrained=options.imagenet_pretrained,
+        imagenet_pretrained=(
+            options.imagenet_pretrained and distributed_context.is_main
+        ),
     ).set_vv_normalization(vv_mean, vv_std).to(device)
     train_loader, val_loader = get_geoid_water_loaders(
         index,
         batch_size=options.batch_size,
         num_workers=options.num_workers,
         augmentation=options.augmentation,
+        distributed_context=distributed_context,
+        sampler_seed=options.seed,
     )
     criterion = nn.CrossEntropyLoss(ignore_index=GEOID_IGNORE_INDEX)
     optimizer = build_optimizer(
@@ -294,23 +309,31 @@ def main(argv=None):
         T_max=options.epochs,
         eta_min=options.eta_min,
     )
+    training_model = wrap_distributed_model(model, distributed_context)
     config = _serializable_config(
         options,
         index,
         vv_mean,
         vv_std,
         file_inventory,
+        distributed_context,
     )
-    print(json.dumps({'dataset': {
-        'samples_per_split': config['samples_per_split'],
-        'samples_per_time': config['samples_per_time'],
-        'vv_mean': config['vv_mean'],
-        'vv_std': config['vv_std'],
-        'ignored_label': config['ignore_index'],
-    }}, sort_keys=True))
+    if distributed_context.is_main:
+        print(json.dumps({'dataset': {
+            'samples_per_split': config['samples_per_split'],
+            'samples_per_time': config['samples_per_time'],
+            'vv_mean': config['vv_mean'],
+            'vv_std': config['vv_std'],
+            'ignored_label': config['ignore_index'],
+            'world_size': config['world_size'],
+            'global_batch_size': config['global_batch_size'],
+        }}, sort_keys=True))
 
     timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    writer = SummaryWriter(str(save_dir / 'log' / timestamp))
+    writer = (
+        SummaryWriter(str(save_dir / 'log' / timestamp))
+        if distributed_context.is_main else None
+    )
     best_water_iou = float('-inf')
     best_epoch = None
     checks_without_improvement = 0
@@ -318,30 +341,35 @@ def main(argv=None):
 
     try:
         for epoch in range(1, options.epochs + 1):
+            set_loader_epoch(train_loader, epoch)
             train_metrics = run_epoch(
-                model,
+                training_model,
                 train_loader,
                 criterion,
                 device,
                 optimizer=optimizer,
                 progress_description=(
                     f'GEOID train {epoch}/{options.epochs}'
-                    if options.progress else None
+                    if options.progress and distributed_context.is_main
+                    else None
                 ),
             )
+            synchronize_model_buffers(training_model, distributed_context)
             val_metrics = run_epoch(
-                model,
+                unwrap_model(training_model),
                 val_loader,
                 criterion,
                 device,
                 progress_description=(
                     f'GEOID val {epoch}/{options.epochs}'
-                    if options.progress else None
+                    if options.progress and distributed_context.is_main
+                    else None
                 ),
             )
-            _write_metrics(writer, 'train', train_metrics, epoch)
-            _write_metrics(writer, 'val', val_metrics, epoch)
-            _print_epoch(epoch, train_metrics, val_metrics, optimizer)
+            if distributed_context.is_main:
+                _write_metrics(writer, 'train', train_metrics, epoch)
+                _write_metrics(writer, 'val', val_metrics, epoch)
+                _print_epoch(epoch, train_metrics, val_metrics, optimizer)
 
             current_iou = val_metrics['water_iou']
             improved = current_iou > (
@@ -355,23 +383,25 @@ def main(argv=None):
                 checks_without_improvement += 1
 
             scheduler.step()
-            payload = _pretraining_payload(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                best_water_iou,
-                train_metrics,
-                val_metrics,
-                config,
-            )
-            save_checkpoint(save_dir / 'last.pth', payload)
-            if improved:
-                save_checkpoint(save_dir / 'best.pth', payload)
-                print(
-                    f'Validation water IoU improved to {best_water_iou:.6f}; '
-                    f'saved {save_dir / "best.pth"}'
+            if distributed_context.is_main:
+                payload = _pretraining_payload(
+                    unwrap_model(training_model),
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    best_water_iou,
+                    train_metrics,
+                    val_metrics,
+                    config,
                 )
+                save_checkpoint(save_dir / 'last.pth', payload)
+                if improved:
+                    save_checkpoint(save_dir / 'best.pth', payload)
+                    print(
+                        'Validation water IoU improved to '
+                        f'{best_water_iou:.6f}; '
+                        f'saved {save_dir / "best.pth"}'
+                    )
 
             if (
                 options.early_stopping_patience > 0
@@ -384,17 +414,28 @@ def main(argv=None):
                 )
                 break
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         close_loader(train_loader)
         close_loader(val_loader)
 
-    print(f'GEOID pretraining complete: {stop_reason}.')
-    if best_epoch is not None:
-        print(
-            f'Best validation water IoU: {best_water_iou:.6f} '
-            f'at epoch {best_epoch}; checkpoint: {save_dir / "best.pth"}'
-        )
+    if distributed_context.is_main:
+        print(f'GEOID pretraining complete: {stop_reason}.')
+        if best_epoch is not None:
+            print(
+                f'Best validation water IoU: {best_water_iou:.6f} '
+                f'at epoch {best_epoch}; checkpoint: {save_dir / "best.pth"}'
+            )
     return save_dir / 'best.pth' if best_epoch is not None else None
+
+
+def main(argv=None):
+    options = build_parser().parse_args(argv)
+    distributed_context = initialize_distributed(options.device)
+    try:
+        return _run(options, distributed_context)
+    finally:
+        cleanup_distributed(distributed_context)
 
 
 if __name__ == '__main__':

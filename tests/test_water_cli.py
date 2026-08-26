@@ -156,6 +156,9 @@ class WaterCliTest(unittest.TestCase):
             )
             self.assertEqual(checkpoint['format_version'], 2)
             self.assertEqual(checkpoint['config']['vv_mean'], -15.0)
+            self.assertFalse(checkpoint['config']['distributed'])
+            self.assertEqual(checkpoint['config']['world_size'], 1)
+            self.assertEqual(checkpoint['config']['global_batch_size'], 2)
             self.assertEqual(
                 checkpoint['config']['samples_per_split'],
                 {'train': 3, 'val': 3, 'test': 3},

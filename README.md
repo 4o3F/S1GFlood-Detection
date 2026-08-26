@@ -444,8 +444,16 @@ You can download our novel public S1GFloods dataset through the following link:
   uv run python -m water_seg.compute_geoid_stats \
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
 
+  # Single GPU
   uv run python -m water_seg.pretrain_geoid \
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
+
+  # Two GPUs (use instead of the single-GPU command)
+  CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
+    --standalone --nproc_per_node=2 \
+    -m water_seg.pretrain_geoid \
+    --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
+    --batch-size 8 --num-workers 2
 
   uv run python -m water_seg.train \
     --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \

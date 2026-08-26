@@ -17,8 +17,12 @@ from water_seg.dataset import (build_kulsary_scene_index,
                                source_fingerprints, tile_split_records)
 from water_seg.engine import (INPUT_CONTRACT, NORMALIZATION_CONTRACT,
                               build_optimizer, checkpoint_payload,
-                              close_loader, load_initial_model_weights,
-                              run_epoch, save_checkpoint, seed_everything)
+                              cleanup_distributed, close_loader,
+                              initialize_distributed,
+                              load_initial_model_weights, run_epoch,
+                              save_checkpoint, seed_everything,
+                              set_loader_epoch, synchronize_model_buffers,
+                              unwrap_model, wrap_distributed_model)
 from water_seg.model import SwinTinyUNet
 
 
@@ -97,12 +101,6 @@ def _validate_data_options(options):
         raise ValueError('train/val/test ratios must sum to 1')
 
 
-def _resolve_device(requested):
-    if requested:
-        return torch.device(requested)
-    return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-
 def _samples_per_split(index):
     return {
         split: len(index.samples_for(split))
@@ -117,10 +115,17 @@ def _serializable_config(
     vv_std,
     input_provenance,
     initialization,
+    distributed_context,
 ):
     return {
         'epochs': options.epochs,
         'batch_size': options.batch_size,
+        'batch_size_per_rank': options.batch_size,
+        'global_batch_size': (
+            options.batch_size * distributed_context.world_size
+        ),
+        'distributed': distributed_context.distributed,
+        'world_size': distributed_context.world_size,
         'num_workers': options.num_workers,
         'encoder_lr': options.encoder_lr,
         'decoder_lr': options.decoder_lr,
@@ -187,12 +192,11 @@ def _print_epoch(epoch, train_metrics, val_metrics, optimizer):
     print(json.dumps(summary, sort_keys=True))
 
 
-def main(argv=None):
-    options = build_parser().parse_args(argv)
+def _run(options, distributed_context):
     _validate_data_options(options)
     save_dir = Path(options.save_dir)
-    seed_everything(options.seed)
-    device = _resolve_device(options.device)
+    seed_everything(options.seed + distributed_context.rank)
+    device = distributed_context.device
 
     sigma0_paths, input_provenance = resolve_sigma0_paths(
         sigma0_root=options.sigma0_root,
@@ -218,7 +222,9 @@ def main(argv=None):
         options.imagenet_pretrained and options.init_checkpoint is None
     )
     model = SwinTinyUNet(
-        imagenet_pretrained=use_imagenet_initialization,
+        imagenet_pretrained=(
+            use_imagenet_initialization and distributed_context.is_main
+        ),
     )
     initialization = None
     if options.init_checkpoint is not None:
@@ -246,6 +252,8 @@ def main(argv=None):
         batch_size=options.batch_size,
         num_workers=options.num_workers,
         augmentation=options.augmentation,
+        distributed_context=distributed_context,
+        sampler_seed=options.seed,
     )
     criterion = nn.CrossEntropyLoss()
     optimizer = build_optimizer(
@@ -259,6 +267,7 @@ def main(argv=None):
         T_max=options.epochs,
         eta_min=options.eta_min,
     )
+    training_model = wrap_distributed_model(model, distributed_context)
 
     config = _serializable_config(
         options,
@@ -267,18 +276,25 @@ def main(argv=None):
         vv_std,
         input_provenance,
         initialization,
+        distributed_context,
     )
-    print(json.dumps({
-        'dataset': {
-            'kept_tiles': config['kept_tile_count'],
-            'samples_per_split': config['samples_per_split'],
-            'vv_mean': config['vv_mean'],
-            'vv_std': config['vv_std'],
-        }
-    }, sort_keys=True))
+    if distributed_context.is_main:
+        print(json.dumps({
+            'dataset': {
+                'kept_tiles': config['kept_tile_count'],
+                'samples_per_split': config['samples_per_split'],
+                'vv_mean': config['vv_mean'],
+                'vv_std': config['vv_std'],
+                'world_size': config['world_size'],
+                'global_batch_size': config['global_batch_size'],
+            }
+        }, sort_keys=True))
 
     timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    writer = SummaryWriter(str(save_dir / 'log' / timestamp))
+    writer = (
+        SummaryWriter(str(save_dir / 'log' / timestamp))
+        if distributed_context.is_main else None
+    )
     best_water_iou = float('-inf')
     best_epoch = None
     checks_without_improvement = 0
@@ -286,30 +302,35 @@ def main(argv=None):
 
     try:
         for epoch in range(1, options.epochs + 1):
+            set_loader_epoch(train_loader, epoch)
             train_metrics = run_epoch(
-                model,
+                training_model,
                 train_loader,
                 criterion,
                 device,
                 optimizer=optimizer,
                 progress_description=(
                     f'Kulsary train {epoch}/{options.epochs}'
-                    if options.progress else None
+                    if options.progress and distributed_context.is_main
+                    else None
                 ),
             )
+            synchronize_model_buffers(training_model, distributed_context)
             val_metrics = run_epoch(
-                model,
+                unwrap_model(training_model),
                 val_loader,
                 criterion,
                 device,
                 progress_description=(
                     f'Kulsary val {epoch}/{options.epochs}'
-                    if options.progress else None
+                    if options.progress and distributed_context.is_main
+                    else None
                 ),
             )
-            _write_metrics(writer, 'train', train_metrics, epoch)
-            _write_metrics(writer, 'val', val_metrics, epoch)
-            _print_epoch(epoch, train_metrics, val_metrics, optimizer)
+            if distributed_context.is_main:
+                _write_metrics(writer, 'train', train_metrics, epoch)
+                _write_metrics(writer, 'val', val_metrics, epoch)
+                _print_epoch(epoch, train_metrics, val_metrics, optimizer)
 
             current_iou = val_metrics['water_iou']
             improved = current_iou > (
@@ -323,23 +344,25 @@ def main(argv=None):
                 checks_without_improvement += 1
 
             scheduler.step()
-            payload = checkpoint_payload(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                best_water_iou,
-                train_metrics,
-                val_metrics,
-                config,
-            )
-            save_checkpoint(save_dir / 'last.pth', payload)
-            if improved:
-                save_checkpoint(save_dir / 'best.pth', payload)
-                print(
-                    f'Validation water IoU improved to {best_water_iou:.6f}; '
-                    f'saved {save_dir / "best.pth"}'
+            if distributed_context.is_main:
+                payload = checkpoint_payload(
+                    unwrap_model(training_model),
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    best_water_iou,
+                    train_metrics,
+                    val_metrics,
+                    config,
                 )
+                save_checkpoint(save_dir / 'last.pth', payload)
+                if improved:
+                    save_checkpoint(save_dir / 'best.pth', payload)
+                    print(
+                        'Validation water IoU improved to '
+                        f'{best_water_iou:.6f}; '
+                        f'saved {save_dir / "best.pth"}'
+                    )
 
             if (
                 options.early_stopping_patience > 0
@@ -352,17 +375,28 @@ def main(argv=None):
                 )
                 break
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         close_loader(train_loader)
         close_loader(val_loader)
 
-    print(f'Training complete: {stop_reason}.')
-    if best_epoch is not None:
-        print(
-            f'Best validation water IoU: {best_water_iou:.6f} '
-            f'at epoch {best_epoch}; checkpoint: {save_dir / "best.pth"}'
-        )
+    if distributed_context.is_main:
+        print(f'Training complete: {stop_reason}.')
+        if best_epoch is not None:
+            print(
+                f'Best validation water IoU: {best_water_iou:.6f} '
+                f'at epoch {best_epoch}; checkpoint: {save_dir / "best.pth"}'
+            )
     return save_dir / 'best.pth' if best_epoch is not None else None
+
+
+def main(argv=None):
+    options = build_parser().parse_args(argv)
+    distributed_context = initialize_distributed(options.device)
+    try:
+        return _run(options, distributed_context)
+    finally:
+        cleanup_distributed(distributed_context)
 
 
 if __name__ == '__main__':

@@ -24,6 +24,27 @@ uv run python -m water_seg.pretrain_geoid \
   --num-workers 4
 ```
 
+For one machine with two GPUs, launch one process per visible GPU:
+
+```shell
+CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  -m water_seg.pretrain_geoid \
+  --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
+  --batch-size 8 \
+  --num-workers 2 \
+  --save-dir .tmp/geoid_swin_tiny_unet
+```
+
+In DDP mode, `--batch-size` and `--num-workers` are per process/GPU. The command
+above therefore uses global batch size 16 and four loader workers in total.
+Learning rates are not scaled automatically. Train metrics and validation
+confusion counts are reduced across both ranks; validation shards contain no
+padding duplicates. Only rank 0 displays progress, writes TensorBoard events,
+and saves `best.pth`/`last.pth`. Checkpoints retain ordinary unwrapped model
+keys and are interchangeable with single-GPU runs.
+
 `compute_geoid_stats` is a one-time offline pass. It displays source-level
 progress, computes the exact train-window-weighted VV mean/std, and atomically
 replaces `water_seg/geoid_stats.py` with Python constants plus the metadata
@@ -66,6 +87,20 @@ uv run python -m water_seg.train \
   --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
   --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
   --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth
+```
+
+The same target fine-tuning can use both GPUs:
+
+```shell
+CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  -m water_seg.train \
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
+  --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth \
+  --batch-size 4 \
+  --num-workers 2
 ```
 
 `--init-checkpoint` restores model weights only. Kulsary train-split VV

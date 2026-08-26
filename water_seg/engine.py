@@ -1,9 +1,12 @@
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import random
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 
@@ -34,6 +37,111 @@ _REQUIRED_CONFIG_KEYS = {
     'tile_splits',
     'source_fingerprints',
 }
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    rank: int
+    world_size: int
+    local_rank: int
+    device: torch.device
+    initialized_here: bool = False
+
+    @property
+    def distributed(self):
+        return self.world_size > 1
+
+    @property
+    def is_main(self):
+        return self.rank == 0
+
+
+def initialize_distributed(requested_device=None):
+    """Initialize a torchrun environment, or return a single-process context."""
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size <= 1:
+        if requested_device:
+            device = torch.device(requested_device)
+        else:
+            device = torch.device(
+                'cuda:0' if torch.cuda.is_available() else 'cpu'
+            )
+        return DistributedContext(0, 1, 0, device)
+
+    if not dist.is_available():
+        raise RuntimeError('torch.distributed is unavailable')
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    requested = torch.device(requested_device) if requested_device else None
+    force_cpu = requested is not None and requested.type == 'cpu'
+    if torch.cuda.is_available() and not force_cpu:
+        if local_rank >= torch.cuda.device_count():
+            raise ValueError(
+                f'LOCAL_RANK {local_rank} exceeds visible CUDA device count '
+                f'{torch.cuda.device_count()}'
+            )
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+        backend = 'nccl'
+    else:
+        if requested is not None and requested.type != 'cpu':
+            raise ValueError('CUDA was requested but is unavailable')
+        device = torch.device('cpu')
+        backend = 'gloo'
+
+    initialized_here = not dist.is_initialized()
+    if initialized_here:
+        dist.init_process_group(backend=backend, init_method='env://')
+    if dist.get_rank() != rank or dist.get_world_size() != world_size:
+        raise RuntimeError('torchrun rank metadata disagrees with process group')
+    return DistributedContext(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+        initialized_here=initialized_here,
+    )
+
+
+def cleanup_distributed(context):
+    if (
+        context is not None
+        and context.initialized_here
+        and dist.is_available()
+        and dist.is_initialized()
+    ):
+        dist.destroy_process_group()
+
+
+def wrap_distributed_model(model, context):
+    if not context.distributed:
+        return model
+    if context.device.type == 'cuda':
+        return DistributedDataParallel(
+            model,
+            device_ids=[context.local_rank],
+            output_device=context.local_rank,
+        )
+    return DistributedDataParallel(model)
+
+
+def unwrap_model(model):
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def synchronize_model_buffers(model, context):
+    if not context.distributed:
+        return
+    for buffer in unwrap_model(model).buffers():
+        dist.broadcast(buffer, src=0)
+
+
+def set_loader_epoch(loader, epoch):
+    sampler = getattr(loader, 'sampler', None)
+    if sampler is not None and hasattr(sampler, 'set_epoch'):
+        sampler.set_epoch(epoch)
 
 
 def seed_everything(seed):
@@ -138,6 +246,25 @@ def run_epoch(
                 predictions,
                 ignore_index=ignore_index,
             )
+
+    if dist.is_available() and dist.is_initialized():
+        totals = torch.tensor(
+            [
+                loss_sum,
+                sample_count,
+                valid_pixel_count,
+                *confusion.reshape(-1).tolist(),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        loss_sum = float(totals[0].item())
+        sample_count = int(totals[1].item())
+        valid_pixel_count = int(totals[2].item())
+        confusion = (
+            totals[3:].detach().cpu().numpy().astype(np.int64).reshape(2, 2)
+        )
 
     if sample_count == 0:
         raise ValueError('water segmentation loader is empty')

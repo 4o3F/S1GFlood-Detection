@@ -8,6 +8,7 @@ import random
 import numpy as np
 import torch
 import torch.utils.data as data
+from torch.utils.data.distributed import DistributedSampler
 
 from utils.kulsary_raster import (
     PATCH_SIZE,
@@ -486,10 +487,60 @@ def water_worker_init_fn(worker_id):
     np.random.seed(int(seed))
 
 
-def _water_loader(dataset, batch_size, num_workers, shuffle):
+class DistributedEvalSampler(data.Sampler):
+    """Shard evaluation without DistributedSampler's duplicate padding."""
+
+    def __init__(self, dataset, num_replicas, rank):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if self.num_replicas <= 0:
+            raise ValueError('num_replicas must be positive')
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError('rank must be within num_replicas')
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.rank
+        if remaining <= 0:
+            return 0
+        return (remaining + self.num_replicas - 1) // self.num_replicas
+
+
+def _water_loader(
+    dataset,
+    batch_size,
+    num_workers,
+    shuffle,
+    distributed_context=None,
+    sampler_seed=0,
+):
+    sampler = None
+    if (
+        distributed_context is not None
+        and distributed_context.distributed
+    ):
+        if shuffle:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=distributed_context.world_size,
+                rank=distributed_context.rank,
+                shuffle=True,
+                seed=int(sampler_seed),
+                drop_last=False,
+            )
+        else:
+            sampler = DistributedEvalSampler(
+                dataset,
+                num_replicas=distributed_context.world_size,
+                rank=distributed_context.rank,
+            )
     kwargs = {
         'batch_size': batch_size,
-        'shuffle': shuffle,
+        'shuffle': shuffle if sampler is None else False,
+        'sampler': sampler,
         'num_workers': num_workers,
         'drop_last': False,
         'pin_memory': torch.cuda.is_available(),
@@ -500,7 +551,14 @@ def _water_loader(dataset, batch_size, num_workers, shuffle):
     return data.DataLoader(dataset, **kwargs)
 
 
-def get_water_loaders(index, batch_size, num_workers, augmentation=True):
+def get_water_loaders(
+    index,
+    batch_size,
+    num_workers,
+    augmentation=True,
+    distributed_context=None,
+    sampler_seed=0,
+):
     train_dataset = KulsaryRawWaterDataset(
         index,
         'train',
@@ -508,8 +566,22 @@ def get_water_loaders(index, batch_size, num_workers, augmentation=True):
     )
     val_dataset = KulsaryRawWaterDataset(index, 'val', augment=False)
     return (
-        _water_loader(train_dataset, batch_size, num_workers, shuffle=True),
-        _water_loader(val_dataset, batch_size, num_workers, shuffle=False),
+        _water_loader(
+            train_dataset,
+            batch_size,
+            num_workers,
+            shuffle=True,
+            distributed_context=distributed_context,
+            sampler_seed=sampler_seed,
+        ),
+        _water_loader(
+            val_dataset,
+            batch_size,
+            num_workers,
+            shuffle=False,
+            distributed_context=distributed_context,
+            sampler_seed=sampler_seed,
+        ),
     )
 
 

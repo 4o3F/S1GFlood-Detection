@@ -30,6 +30,21 @@ a transfer checkpoint. Kulsary training may restore its model tensors through
 statistics and creates a fresh optimizer/scheduler. Joint source/target batches
 are intentionally not supported.
 
+## Single-node distributed training
+
+Both training entry points infer DDP from the environment populated by
+`torchrun`. Each rank binds to `cuda:LOCAL_RANK`; the CLI batch size and worker
+count are per rank. Training uses `DistributedSampler` with a shared seed and
+epoch update. Validation uses an unpadded rank-strided sampler, then loss and
+the global 2x2 confusion matrix are all-reduced before metric computation.
+
+The DDP wrapper synchronizes gradients, while model buffers are explicitly
+broadcast from rank 0 before unwrapped validation. Rank 0 alone emits progress,
+TensorBoard data, console summaries, and atomic checkpoints. Payloads serialize
+the unwrapped model so no `module.` prefix enters either GEOID transfer or
+Kulsary format-2 checkpoints. A non-`torchrun` invocation remains the original
+single-process path.
+
 Before the first pretraining run, `compute_geoid_stats` scans the selected
 training coverage once. It groups overlapping windows by source raster, derives
 their exact coverage weights, and writes mean/std plus selection provenance to

@@ -107,6 +107,9 @@ class GEOIDPretrainCliTest(unittest.TestCase):
         self.assertEqual(checkpoint['format_version'], 1)
         self.assertEqual(checkpoint['config']['band'], 'VV')
         self.assertEqual(checkpoint['config']['ignore_index'], 255)
+        self.assertFalse(checkpoint['config']['distributed'])
+        self.assertEqual(checkpoint['config']['world_size'], 1)
+        self.assertEqual(checkpoint['config']['global_batch_size'], 2)
         self.assertEqual(
             checkpoint['config']['samples_per_split'],
             {'train': 2, 'val': 1},

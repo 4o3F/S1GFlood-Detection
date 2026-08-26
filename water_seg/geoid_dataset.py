@@ -476,6 +476,8 @@ def get_geoid_water_loaders(
     batch_size,
     num_workers,
     augmentation=True,
+    distributed_context=None,
+    sampler_seed=0,
 ):
     train_dataset = GEOIDRawWaterDataset(
         index,
@@ -484,6 +486,20 @@ def get_geoid_water_loaders(
     )
     val_dataset = GEOIDRawWaterDataset(index, 'val', augment=False)
     return (
-        _water_loader(train_dataset, batch_size, num_workers, shuffle=True),
-        _water_loader(val_dataset, batch_size, num_workers, shuffle=False),
+        _water_loader(
+            train_dataset,
+            batch_size,
+            num_workers,
+            shuffle=True,
+            distributed_context=distributed_context,
+            sampler_seed=sampler_seed,
+        ),
+        _water_loader(
+            val_dataset,
+            batch_size,
+            num_workers,
+            shuffle=False,
+            distributed_context=distributed_context,
+            sampler_seed=sampler_seed,
+        ),
     )
