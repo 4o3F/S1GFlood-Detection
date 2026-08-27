@@ -10,16 +10,18 @@ from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 
-CHECKPOINT_FORMAT_VERSION = 2
-INPUT_CONTRACT = 'single VV channel, clipped dB'
-NORMALIZATION_CONTRACT = 'train-split clipped-dB mean/std'
+CHECKPOINT_FORMAT_VERSION = 3
+POLARIZATIONS = ('VV', 'VH')
+INPUT_CONTRACT = 'dual VV+VH channels in [VV,VH] order, clipped dB'
+NORMALIZATION_CONTRACT = 'per-channel train-split clipped-dB mean/std'
 _REQUIRED_CONFIG_KEYS = {
     'architecture',
     'input',
     'in_chans',
     'normalization',
-    'vv_mean',
-    'vv_std',
+    'polarizations',
+    'channel_mean',
+    'channel_std',
     'db_min',
     'db_max',
     'sigma0_before',
@@ -152,6 +154,64 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+
+def capture_rng_state():
+    numpy_state = np.random.get_state()
+    return {
+        'python': random.getstate(),
+        'numpy': {
+            'bit_generator': numpy_state[0],
+            'keys': numpy_state[1].tolist(),
+            'position': int(numpy_state[2]),
+            'has_gauss': int(numpy_state[3]),
+            'cached_gaussian': float(numpy_state[4]),
+        },
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def collect_rng_states(context):
+    """Collect one serializable RNG state per rank at an epoch boundary."""
+    local_state = capture_rng_state()
+    if not context.distributed:
+        return [local_state]
+    states = [None] * context.world_size
+    dist.all_gather_object(states, local_state)
+    return states
+
+
+def restore_rng_state(states, rank, world_size):
+    if not isinstance(states, list) or len(states) != world_size:
+        raise ValueError(
+            'resume checkpoint RNG states do not match the current world size'
+        )
+    if not 0 <= rank < len(states):
+        raise ValueError('resume rank is outside saved RNG states')
+    state = states[rank]
+    if not isinstance(state, dict):
+        raise ValueError('resume checkpoint RNG state is invalid')
+    required = {'python', 'numpy', 'torch', 'cuda'}
+    if set(state) != required:
+        raise ValueError('resume checkpoint RNG state has invalid fields')
+    random.setstate(state['python'])
+    numpy_state = state['numpy']
+    np.random.set_state((
+        numpy_state['bit_generator'],
+        np.asarray(numpy_state['keys'], dtype=np.uint32),
+        int(numpy_state['position']),
+        int(numpy_state['has_gauss']),
+        float(numpy_state['cached_gaussian']),
+    ))
+    torch.set_rng_state(state['torch'])
+    if torch.cuda.is_available():
+        cuda_states = state['cuda']
+        if len(cuda_states) != torch.cuda.device_count():
+            raise ValueError(
+                'resume checkpoint CUDA RNG states do not match visible devices'
+            )
+        torch.cuda.set_rng_state_all(cuda_states)
 
 
 def _safe_divide(numerator, denominator):
@@ -317,14 +377,22 @@ def checkpoint_payload(
     train_metrics,
     val_metrics,
     config,
+    *,
+    best_epoch=None,
+    checks_without_improvement=0,
+    rng_states=None,
+    format_version=CHECKPOINT_FORMAT_VERSION,
 ):
     return {
-        'format_version': CHECKPOINT_FORMAT_VERSION,
+        'format_version': format_version,
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'best_water_iou': best_water_iou,
+        'best_epoch': best_epoch,
+        'checks_without_improvement': int(checks_without_improvement),
+        'rng_states': rng_states,
         'train_metrics': dict(train_metrics),
         'val_metrics': dict(val_metrics),
         'config': dict(config),
@@ -337,6 +405,119 @@ def save_checkpoint(path, payload):
     temporary_path = checkpoint_path.with_suffix(checkpoint_path.suffix + '.tmp')
     torch.save(payload, temporary_path)
     os.replace(temporary_path, checkpoint_path)
+
+
+def load_checkpoint_file(path, map_location='cpu'):
+    checkpoint_path = Path(path).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f'training checkpoint is missing: {checkpoint_path}'
+        )
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=map_location,
+        weights_only=True,
+    )
+    if not isinstance(checkpoint, dict):
+        raise ValueError('training checkpoint must be a dictionary')
+    return checkpoint
+
+
+_RESUME_MUTABLE_CONFIG_KEYS = {
+    'progress',
+    'imagenet_pretrained',
+    'imagenet_pretrained_requested',
+    'resume',
+}
+
+
+def validate_resume_config(saved_config, current_config):
+    if not isinstance(saved_config, dict) or not isinstance(current_config, dict):
+        raise ValueError('resume checkpoint configs must be dictionaries')
+    keys = (
+        set(saved_config) | set(current_config)
+    ) - _RESUME_MUTABLE_CONFIG_KEYS
+    mismatches = []
+    for key in sorted(keys):
+        if key not in saved_config or key not in current_config:
+            mismatches.append(key)
+        elif saved_config[key] != current_config[key]:
+            mismatches.append(key)
+    if mismatches:
+        raise ValueError(
+            'resume checkpoint is incompatible with current training config: '
+            + ', '.join(mismatches)
+        )
+
+
+def restore_training_state(
+    checkpoint,
+    model,
+    optimizer,
+    scheduler,
+    current_config,
+    distributed_context,
+    *,
+    expected_format_version,
+    expected_kind=None,
+    expected_architecture=None,
+    validate_kulsary_config=False,
+):
+    if checkpoint.get('format_version') != expected_format_version:
+        raise ValueError(
+            'resume checkpoint format is incompatible: expected '
+            f'{expected_format_version}, got {checkpoint.get("format_version")}'
+        )
+    if expected_kind is not None and checkpoint.get('kind') != expected_kind:
+        raise ValueError(
+            f'resume checkpoint kind must be {expected_kind}, '
+            f'got {checkpoint.get("kind")}'
+        )
+    required = {
+        'epoch',
+        'model_state_dict',
+        'optimizer_state_dict',
+        'scheduler_state_dict',
+        'best_water_iou',
+        'best_epoch',
+        'checks_without_improvement',
+        'rng_states',
+        'config',
+    }
+    missing = sorted(required - checkpoint.keys())
+    if missing:
+        raise ValueError(
+            f'resume checkpoint is missing training state: {missing}'
+        )
+    if validate_kulsary_config:
+        _validate_checkpoint_config(
+            checkpoint['config'],
+            expected_architecture,
+        )
+    elif expected_architecture is not None:
+        architecture = checkpoint['config'].get('architecture')
+        if architecture != expected_architecture:
+            raise ValueError(
+                f'checkpoint architecture must be {expected_architecture}, '
+                f'got {architecture}'
+            )
+    validate_resume_config(checkpoint['config'], current_config)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    restore_rng_state(
+        checkpoint['rng_states'],
+        distributed_context.rank,
+        distributed_context.world_size,
+    )
+    return {
+        'start_epoch': int(checkpoint['epoch']) + 1,
+        'best_water_iou': float(checkpoint['best_water_iou']),
+        'best_epoch': checkpoint['best_epoch'],
+        'checks_without_improvement': int(
+            checkpoint['checks_without_improvement']
+        ),
+    }
 
 
 def _validate_checkpoint_config(config, expected_architecture):
@@ -363,15 +544,25 @@ def _validate_checkpoint_config(config, expected_architecture):
             'checkpoint normalization contract must be '
             f'{NORMALIZATION_CONTRACT}'
         )
-    if config.get('in_chans') != 1:
-        raise ValueError('water checkpoint must use one VV input channel')
+    if config.get('in_chans') != len(POLARIZATIONS):
+        raise ValueError('water checkpoint must use VV+VH input channels')
+    if tuple(config.get('polarizations', ())) != POLARIZATIONS:
+        raise ValueError(
+            f'checkpoint polarizations must be {POLARIZATIONS}'
+        )
 
-    vv_mean = float(config['vv_mean'])
-    vv_std = float(config['vv_std'])
-    if not np.isfinite(vv_mean):
-        raise ValueError('checkpoint vv_mean must be finite')
-    if not np.isfinite(vv_std) or vv_std <= 0:
-        raise ValueError('checkpoint vv_std must be finite and positive')
+    channel_mean = np.asarray(config['channel_mean'], dtype=np.float64)
+    channel_std = np.asarray(config['channel_std'], dtype=np.float64)
+    if channel_mean.shape != (len(POLARIZATIONS),):
+        raise ValueError('checkpoint channel_mean has invalid dimensions')
+    if channel_std.shape != (len(POLARIZATIONS),):
+        raise ValueError('checkpoint channel_std has invalid dimensions')
+    if not np.isfinite(channel_mean).all():
+        raise ValueError('checkpoint channel_mean must be finite')
+    if not np.isfinite(channel_std).all() or (channel_std <= 0).any():
+        raise ValueError(
+            'checkpoint channel_std must be finite and positive'
+        )
 
     db_min = float(config['db_min'])
     db_max = float(config['db_max'])
@@ -445,10 +636,10 @@ def load_model_checkpoint(
         raise ValueError('water checkpoint must be a dictionary')
     format_version = checkpoint.get('format_version')
     if format_version != CHECKPOINT_FORMAT_VERSION:
-        if format_version == 1:
+        if format_version in {1, 2}:
             raise ValueError(
-                'water checkpoint format 1 used quantized 0-255 VV with an '
-                'RGB ImageNet stem; retrain for format 2 clipped-dB input'
+                f'water checkpoint format {format_version} is a legacy '
+                'single-polarization model; retrain with VV+VH format 3 input'
             )
         raise ValueError(
             'unsupported water checkpoint format: '
@@ -467,14 +658,18 @@ def load_model_checkpoint(
     )
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-    if hasattr(model, 'vv_mean') and hasattr(model, 'vv_std'):
+    if hasattr(model, 'channel_mean') and hasattr(model, 'channel_std'):
         config = checkpoint['config']
-        model_mean = float(model.vv_mean.detach().cpu().item())
-        model_std = float(model.vv_std.detach().cpu().item())
-        if not np.isclose(model_mean, float(config['vv_mean'])):
-            raise ValueError('checkpoint vv_mean disagrees with model state')
-        if not np.isclose(model_std, float(config['vv_std'])):
-            raise ValueError('checkpoint vv_std disagrees with model state')
+        model_mean = model.channel_mean.detach().cpu().numpy().reshape(-1)
+        model_std = model.channel_std.detach().cpu().numpy().reshape(-1)
+        if not np.allclose(model_mean, config['channel_mean']):
+            raise ValueError(
+                'checkpoint channel_mean disagrees with model state'
+            )
+        if not np.allclose(model_std, config['channel_std']):
+            raise ValueError(
+                'checkpoint channel_std disagrees with model state'
+            )
     return checkpoint
 
 
@@ -487,7 +682,7 @@ def load_initial_model_weights(
     """Load a compatible GEOID pretraining or Kulsary model state.
 
     This deliberately restores model tensors only. The caller must set the
-    target dataset's VV normalization after loading.
+    target dataset's per-channel normalization after loading.
     """
     checkpoint = torch.load(
         Path(path),
@@ -507,12 +702,16 @@ def load_initial_model_weights(
     if not isinstance(config, dict):
         raise ValueError('initialization checkpoint config must be a dictionary')
     if checkpoint.get('kind') == 'geoid-water-pretraining':
-        if checkpoint.get('format_version') != 1:
-            raise ValueError('unsupported GEOID pretraining checkpoint format')
+        if checkpoint.get('format_version') != 2:
+            raise ValueError(
+                'unsupported GEOID pretraining checkpoint format; '
+                'VV-only format 1 cannot initialize a VV+VH model'
+            )
         for key, expected in (
             ('input', INPUT_CONTRACT),
             ('normalization', NORMALIZATION_CONTRACT),
-            ('in_chans', 1),
+            ('in_chans', len(POLARIZATIONS)),
+            ('polarizations', list(POLARIZATIONS)),
         ):
             if config.get(key) != expected:
                 raise ValueError(

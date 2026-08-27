@@ -941,7 +941,11 @@ def prepare(args: argparse.Namespace) -> dict:
             cache_root,
             gpt,
         )
-        with Sigma0Stack(sigma0_paths, mask_refs["peak"]) as stack:
+        with Sigma0Stack(
+            sigma0_paths,
+            mask_refs["peak"],
+            polarizations=("VV",),
+        ) as stack:
             water_masks, mask_coverage = warp_masks(mask_refs, stack.grid)
             kept, assigned, skips = _plan_tiles(stack, mask_coverage, args)
             if not kept:

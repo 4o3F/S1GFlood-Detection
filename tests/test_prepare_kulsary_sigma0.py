@@ -19,7 +19,7 @@ from tests.test_kulsary_products import PRODUCTS, write_role_safe
 TRANSFORM = Affine(10.0, 0.0, 500000.0, 0.0, -10.0, 5200000.0)
 
 
-def write_sigma0(path: Path, value=0.1, *, count=1, crs='EPSG:32639'):
+def write_sigma0(path: Path, value=0.1, *, count=2, crs='EPSG:32639'):
     path.parent.mkdir(parents=True, exist_ok=True)
     array = np.full((64, 64), value, dtype=np.float32)
     with rasterio.open(
@@ -36,7 +36,11 @@ def write_sigma0(path: Path, value=0.1, *, count=1, crs='EPSG:32639'):
     ) as dataset:
         for band in range(1, count + 1):
             dataset.write(array, band)
-            dataset.set_band_description(band, 'Sigma0_VV')
+            if band <= len(preprocessor.POLARIZATIONS):
+                dataset.set_band_description(
+                    band,
+                    f'Sigma0_{preprocessor.POLARIZATIONS[band - 1]}',
+                )
 
 
 class KulsarySigma0PreprocessorTest(unittest.TestCase):
@@ -118,11 +122,16 @@ class KulsarySigma0PreprocessorTest(unittest.TestCase):
         )
         self.assertEqual(manifest['format'], 'kulsary-sigma0')
         self.assertEqual(manifest['version'], preprocessor.PREPROCESSOR_VERSION)
+        self.assertEqual(manifest['polarizations'], ['VV', 'VH'])
+        self.assertEqual(manifest['band_order'], {'VV': 1, 'VH': 2})
         self.assertEqual(set(manifest['roles']), {'before', 'peak', 'after'})
         for role, filename in preprocessor.OUTPUT_FILENAMES.items():
             destination = self.output / filename
             self.assertTrue(destination.is_file())
-            preprocessor.validate_sigma0_raster(destination)
+            preprocessor.validate_sigma0_raster(
+                destination,
+                preprocessor.POLARIZATIONS,
+            )
             self.assertEqual(manifest['roles'][role]['output_filename'], filename)
             self.assertEqual(
                 manifest['roles'][role]['product_identifier'],
@@ -235,7 +244,7 @@ class KulsarySigma0PreprocessorTest(unittest.TestCase):
 
     def test_invalid_sigma0_is_rejected(self):
         invalid = self.root / 'invalid.tif'
-        write_sigma0(invalid, 0.1, count=2)
+        write_sigma0(invalid, 0.1, count=3)
         self.rasters['after'] = invalid
         with self.assertRaises(Exception):
             self._run()

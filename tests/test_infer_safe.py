@@ -384,7 +384,7 @@ class SnapCacheTest(unittest.TestCase):
         )
 
     @staticmethod
-    def _write_sigma0(path, value=1.0):
+    def _write_sigma0(path, value=1.0, polarizations=("VV",)):
         path.parent.mkdir(parents=True, exist_ok=True)
         with rasterio.open(
             path,
@@ -392,14 +392,21 @@ class SnapCacheTest(unittest.TestCase):
             driver="GTiff",
             width=16,
             height=16,
-            count=1,
+            count=len(polarizations),
             dtype="float32",
             crs="EPSG:32639",
             transform=from_origin(500000, 5200000, 10, 10),
             nodata=0.0,
         ) as dataset:
-            dataset.write(np.full((16, 16), value, dtype=np.float32), 1)
-            dataset.set_band_description(1, "Sigma0_VV")
+            for band, polarization in enumerate(polarizations, start=1):
+                dataset.write(
+                    np.full((16, 16), value, dtype=np.float32),
+                    band,
+                )
+                dataset.set_band_description(
+                    band,
+                    f"Sigma0_{polarization}",
+                )
 
     def _cache_fixture(self, directory):
         product = self._product(directory)
@@ -487,6 +494,57 @@ class SnapCacheTest(unittest.TestCase):
             )
             changed, _ = build_snap_cache_key(product, graph, str(gpt), args)
             self.assertNotEqual(base, changed)
+
+    def test_dual_polarization_cache_tracks_vh_and_uses_semantic_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            product, graph, gpt = self._cache_fixture(directory)
+            vh_measurement = (
+                product.root / "measurement" / "scene-vh-test.tiff"
+            )
+            vh_measurement.write_bytes(b"vh-one")
+            args = self._args()
+            args.polarizations = ("VV", "VH")
+            first_key, inputs = build_snap_cache_key(
+                product,
+                graph,
+                str(gpt),
+                args,
+            )
+            self.assertEqual(inputs["polarizations"], ["VV", "VH"])
+            inventory_paths = {
+                record["path"] for record in inputs["safe_source_inventory"]
+            }
+            self.assertIn("measurement/scene-vv-test.tiff", inventory_paths)
+            self.assertIn("measurement/scene-vh-test.tiff", inventory_paths)
+
+            vh_measurement.write_bytes(b"vh-two")
+            second_key, _ = build_snap_cache_key(
+                product,
+                graph,
+                str(gpt),
+                args,
+            )
+            self.assertNotEqual(first_key, second_key)
+
+            cache_root = Path(directory) / "dual-cache"
+            output = Path(directory) / "run" / "dual.tif"
+
+            def build(path):
+                self._write_sigma0(path, polarizations=("VV", "VH"))
+
+            cached = get_or_create_sigma0(
+                str(gpt),
+                graph,
+                product,
+                output,
+                args,
+                "dual",
+                cache_root,
+                False,
+                build=build,
+            )
+            self.assertEqual(cached.name, "sigma0_vv_vh.tif")
+            validate_sigma0_raster(cached, ("VV", "VH"))
 
     def test_cache_miss_installs_and_second_call_hits(self):
         with tempfile.TemporaryDirectory() as directory:

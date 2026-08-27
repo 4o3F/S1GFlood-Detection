@@ -12,13 +12,14 @@ from water_seg.engine import (CHECKPOINT_FORMAT_VERSION, INPUT_CONTRACT,
                               NORMALIZATION_CONTRACT, build_optimizer,
                               checkpoint_payload, load_initial_model_weights,
                               load_model_checkpoint, metrics_from_confusion,
-                              run_epoch, save_checkpoint)
+                              run_epoch, save_checkpoint,
+                              validate_resume_config)
 
 
 class TinyWaterModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = nn.Conv2d(1, 2, kernel_size=1)
+        self.encoder = nn.Conv2d(2, 2, kernel_size=1)
         self.head = nn.Conv2d(2, 2, kernel_size=1)
 
     def forward(self, image):
@@ -29,10 +30,11 @@ def checkpoint_config(architecture='tiny'):
     return {
         'architecture': architecture,
         'input': INPUT_CONTRACT,
-        'in_chans': 1,
+        'in_chans': 2,
+        'polarizations': ['VV', 'VH'],
         'normalization': NORMALIZATION_CONTRACT,
-        'vv_mean': -12.5,
-        'vv_std': 4.0,
+        'channel_mean': [-12.5, -18.0],
+        'channel_std': [4.0, 3.0],
         'db_min': -25.0,
         'db_max': 0.0,
         'sigma0_before': '/data/before.tif',
@@ -80,7 +82,7 @@ class WaterEngineTest(unittest.TestCase):
         images = torch.tensor([
             [[[0.0, 1.0], [1.0, 0.0]]],
             [[[1.0, 0.0], [0.0, 1.0]]],
-        ])
+        ]).repeat(1, 2, 1, 1)
         targets = torch.tensor([
             [[0, 1], [1, 0]],
             [[1, 0], [0, 1]],
@@ -174,7 +176,9 @@ class WaterEngineTest(unittest.TestCase):
         self.assertFalse(torch.equal(before, self.model.head.weight.detach()))
 
     def test_epoch_excludes_ignore_index_from_metrics(self):
-        images = torch.tensor([[[[0.0, 1.0], [1.0, 0.0]]]])
+        images = torch.tensor(
+            [[[[0.0, 1.0], [1.0, 0.0]]]]
+        ).repeat(1, 2, 1, 1)
         targets = torch.tensor([[[0, 1], [255, 0]]])
         loader = DataLoader(
             [(images[0], targets[0], 'geoid-sample')],
@@ -225,7 +229,7 @@ class WaterEngineTest(unittest.TestCase):
 
     def test_checkpoint_rejects_missing_required_metadata(self):
         payload = self._payload()
-        del payload['config']['vv_std']
+        del payload['config']['channel_std']
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'invalid.pth'
             torch.save(payload, path)
@@ -248,8 +252,8 @@ class WaterEngineTest(unittest.TestCase):
         for key, value, message in (
             ('input', 'raw 0-255', 'input contract'),
             ('normalization', 'imagenet', 'normalization contract'),
-            ('in_chans', 3, 'one VV'),
-            ('vv_std', 0.0, 'vv_std'),
+            ('in_chans', 3, r'VV\+VH'),
+            ('channel_std', [0.0, 1.0], 'channel_std'),
             ('db_max', -30.0, 'dB range'),
         ):
             with self.subTest(key=key):
@@ -262,6 +266,22 @@ class WaterEngineTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         load_model_checkpoint(path, self.model)
 
+    def test_resume_config_rejects_training_changes_but_allows_logging(self):
+        saved = {
+            'epochs': 20,
+            'batch_size': 8,
+            'progress': True,
+            'resume': None,
+        }
+        validate_resume_config(
+            saved,
+            {**saved, 'progress': False, 'resume': '/tmp/last.pth'},
+        )
+        with self.assertRaisesRegex(ValueError, 'batch_size'):
+            validate_resume_config(saved, {**saved, 'batch_size': 4})
+        with self.assertRaisesRegex(ValueError, 'epochs'):
+            validate_resume_config(saved, {**saved, 'epochs': 30})
+
     def test_geoid_pretraining_checkpoint_loads_model_weights_only(self):
         expected = {
             name: value.detach().clone()
@@ -269,14 +289,15 @@ class WaterEngineTest(unittest.TestCase):
         }
         payload = {
             'kind': 'geoid-water-pretraining',
-            'format_version': 1,
+            'format_version': 2,
             'epoch': 2,
             'model_state_dict': self.model.state_dict(),
             'config': {
                 'architecture': 'tiny',
                 'input': INPUT_CONTRACT,
                 'normalization': NORMALIZATION_CONTRACT,
-                'in_chans': 1,
+                'in_chans': 2,
+                'polarizations': ['VV', 'VH'],
             },
         }
         with tempfile.TemporaryDirectory() as directory:

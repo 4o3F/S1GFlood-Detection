@@ -13,10 +13,10 @@ utils.kulsary_raster      -> common grid, raster windows, mask warp, tile validi
 utils.kulsary_temporal    -> dates, spatial split, unique role samples
 water_seg.dataset         -> Sigma0-root validation, scene index, stats, loaders
 water_seg.geoid_dataset   -> official GEOID CSV windows and label remapping
-water_seg.compute_geoid_stats -> one-time VV statistics constant generator
+water_seg.compute_geoid_stats -> one-time VV+VH statistics constant generator
 water_seg.geoid_stats     -> generated GEOID normalization and provenance
-water_seg.model           -> one-channel Swin-T encoder and U-Net decoder
-water_seg.engine          -> metrics, optimizer, checkpoint format 2
+water_seg.model           -> two-channel Swin-T encoder and U-Net decoder
+water_seg.engine          -> metrics, optimizer, checkpoint/resume contracts
 water_seg.pretrain_geoid  -> GEOID source-domain pretraining CLI
 water_seg.train/eval      -> Kulsary Sigma0 training/evaluation CLIs
 ```
@@ -24,11 +24,11 @@ water_seg.train/eval      -> Kulsary Sigma0 training/evaluation CLIs
 Training accepts a canonical precomputed Sigma0 root or three explicit GeoTIFFs. SAFE discovery and SNAP execution are confined to the standalone preprocessing script; DataLoader workers cannot reach them.
 
 GEOID pretraining is a separate chain. It accepts the official
-`data_tiles_s256_st128.csv`, lazily reads S1-GRD VV windows and labels, and emits
-a transfer checkpoint. Kulsary training may restore its model tensors through
-`--init-checkpoint`, then overwrites VV normalization with Kulsary train-split
-statistics and creates a fresh optimizer/scheduler. Joint source/target batches
-are intentionally not supported.
+`data_tiles_s256_st128.csv`, lazily reads S1-GRD VV+VH windows and labels, and
+emits a transfer checkpoint. Kulsary training may restore its model tensors through
+`--init-checkpoint`, then overwrites per-channel normalization with Kulsary
+train-split statistics and creates a fresh optimizer/scheduler. Joint
+source/target batches are intentionally not supported.
 
 ## Single-node distributed training
 
@@ -42,7 +42,7 @@ The DDP wrapper synchronizes gradients, while model buffers are explicitly
 broadcast from rank 0 before unwrapped validation. Rank 0 alone emits progress,
 TensorBoard data, console summaries, and atomic checkpoints. Payloads serialize
 the unwrapped model so no `module.` prefix enters either GEOID transfer or
-Kulsary format-2 checkpoints. A non-`torchrun` invocation remains the original
+Kulsary format-3 checkpoints. A non-`torchrun` invocation remains the original
 single-process path.
 
 Before the first pretraining run, `compute_geoid_stats` scans the selected
@@ -56,13 +56,14 @@ train sample count differs from the current index.
 
 GEOID raw classes are background 0, permanent water 1, flood 2, and ignore
 255. The complete-water remap is `{0:0,1:1,2:0}` for pre-event imagery and
-`{0:0,1:1,2:1}` for post-event imagery. Ignore-label and invalid/nonpositive VV
-pixels remain ignored in loss and confusion metrics. The index keeps only
-official train/val S1-GRD rows with at least 1% valid label coverage.
+`{0:0,1:1,2:1}` for post-event imagery. Ignore-label and pixels with an
+invalid/nonpositive VV or VH value remain ignored in loss and confusion
+metrics. The index keeps only official train/val S1-GRD rows with at least 1%
+valid label coverage.
 
-Only band 1 VV is read. Each metadata row contributes its `(x,y,256,256)`
-window; overlapping train windows and non-overlapping validation windows remain
-as published. No prepared GEOID tile cache is written.
+Bands 1 and 2 are read in `[VV,VH]` order. Each metadata row contributes its
+`(x,y,256,256)` window; overlapping train windows and non-overlapping validation
+windows remain as published. No prepared GEOID tile cache is written.
 
 ## Stage-one SAFE publication
 
@@ -71,10 +72,10 @@ as published. No prepared GEOID tile cache is written.
 ## Spatial data flow
 
 1. Discover the three PNG+PGW masks and validate identical size/affine.
-2. Open the three one-band Sigma0 GeoTIFFs. Peak defines the common grid; before/after use bilinear `WarpedVRT`.
+2. Open the three two-band `[VV,VH]` Sigma0 GeoTIFFs. Peak defines the common grid; before/after use bilinear `WarpedVRT`.
 3. Clip the grid to the three raster extents and mask extent.
 4. Reproject full-water masks from EPSG:4326 using nearest-neighbor.
-5. Enumerate non-overlapping 256×256 windows, dropping partial edges, incomplete mask coverage, or any tile with invalid/nonpositive Sigma0 in any date.
+5. Enumerate non-overlapping 256×256 windows, dropping partial edges, incomplete mask coverage, or any tile with invalid/nonpositive VV or VH in any date.
 6. Assign valid tiles to deterministic 2×2 spatial super-block train/val/test splits.
 7. Expand each tile to exactly `before`, `peak`, and `after` samples. The pair converter's second peak occurrence is not used.
 
@@ -94,9 +95,13 @@ Dataset samples remain float32 clipped dB:
 linear Sigma0 → 10*log10 → clip [db_min, db_max]
 ```
 
-Train-split role tiles alone provide streaming population mean/std. Validation and test pixels never contribute to normalization statistics.
+Train-split role tiles alone provide streaming per-channel population mean/std.
+Validation and test pixels never contribute to normalization statistics.
 
-The local Swin-T patch embedding is one channel. ImageNet initialization adapts the timm RGB patch weights with `adapt_input_conv(1, weight)`, maps the final timm normalization to local `norm3`, and copies the remaining matching tensors. Forward normalization is `(VV_dB - vv_mean) / vv_std`.
+The local Swin-T patch embedding has two channels. ImageNet initialization adapts
+the timm RGB patch weights with `adapt_input_conv(2, weight)`, maps the final timm
+normalization to local `norm3`, and copies the remaining matching tensors.
+Forward normalization applies the recorded mean/std independently to VV and VH.
 
 ## Model
 
@@ -111,14 +116,16 @@ The encoder produces four scales:
 
 The U-Net decoder uses channels `[512,256,128,64]` and returns two-class full-resolution logits. DAM-Net and its auxiliary water head are not instantiated.
 
-## Checkpoint format 2
+## Checkpoints and resume
 
-The checkpoint stores model/optimizer/scheduler state, metrics, and required provenance:
+Kulsary uses checkpoint format 3; GEOID pretraining uses its separate dual-pol
+format 2. Both store model/optimizer/scheduler state, metrics, and required
+provenance:
 
 ```text
-input = single VV channel, clipped dB
-normalization = train-split clipped-dB mean/std
-vv_mean / vv_std
+input = dual VV+VH channels in [VV,VH] order, clipped dB
+normalization = per-channel train-split clipped-dB mean/std
+channel_mean / channel_std
 db_min / db_max
 three Sigma0 source paths and mask source
 split seed, block size, split ratios
@@ -126,9 +133,17 @@ common-grid signature
 exact kept tile identities and split membership
 sampled content fingerprints for all Sigma0 and mask files
 samples per split
+best epoch and early-stopping counter
+one Python/NumPy/Torch/CUDA RNG state per rank
 ```
 
-Evaluation rebuilds the index with checkpoint paths or explicit relocation paths, applies checkpoint split/dB parameters, and verifies the common grid plus every kept tile's split membership. Format 1 checkpoints are rejected because their three-channel quantized input stem is incompatible.
+Evaluation rebuilds the index with checkpoint paths or explicit relocation
+paths, applies checkpoint split/dB parameters, and verifies the common grid plus
+every kept tile's split membership. `--resume` restores the full state after the
+last completed epoch and requires all data, optimization, scheduler, world-size,
+and epoch-budget settings to match; logging/progress settings may change. Legacy
+single-VV checkpoints are rejected because their stem and normalization contract
+are incompatible.
 
 ## Compatibility invariants
 
@@ -144,5 +159,5 @@ Evaluation rebuilds the index with checkpoint paths or explicit relocation paths
 - The full warped mask arrays reside in memory.
 - Spatial split quality is constrained by one Kulsary event and should be evaluated with additional split seeds when reporting final performance.
 - Current metrics report water-class IoU, not two-class mean IoU.
-- GEOID VV constants must be regenerated explicitly when its metadata or
+- GEOID VV+VH constants must be regenerated explicitly when its metadata or
   radiometry selection changes.

@@ -369,16 +369,48 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
-def _is_vv_measurement(path: Path) -> bool:
+def _is_polarization_measurement(path: Path, polarization: str) -> bool:
     name = path.name.lower()
+    polarization = str(polarization).strip().lower()
+    if polarization not in {"vv", "vh", "hh", "hv"}:
+        raise ValueError(f"unsupported SAR polarization: {polarization}")
     return (
-        "-vv-" in name
-        or "_vv_" in name
-        or name.endswith("-vv.tif")
-        or name.endswith("-vv.tiff")
-        or name.endswith("_vv.tif")
-        or name.endswith("_vv.tiff")
+        f"-{polarization}-" in name
+        or f"_{polarization}_" in name
+        or name.endswith(f"-{polarization}.tif")
+        or name.endswith(f"-{polarization}.tiff")
+        or name.endswith(f"_{polarization}.tif")
+        or name.endswith(f"_{polarization}.tiff")
     )
+
+
+def _is_vv_measurement(path: Path) -> bool:
+    return _is_polarization_measurement(path, "VV")
+
+
+def _expected_polarizations(args=None) -> tuple[str, ...]:
+    values = getattr(args, "polarizations", ("VV",))
+    if isinstance(values, str):
+        values = values.split(",")
+    normalized = tuple(str(value).strip().upper() for value in values)
+    if not normalized or len(set(normalized)) != len(normalized):
+        raise ValueError("polarizations must be a non-empty unique sequence")
+    unsupported = sorted(set(normalized) - {"VV", "VH", "HH", "HV"})
+    if unsupported:
+        raise ValueError(f"unsupported SAR polarizations: {unsupported}")
+    return normalized
+
+
+def _cache_polarizations(inputs: dict[str, object]) -> tuple[str, ...]:
+    return tuple(inputs.get("polarizations", ("VV",)))
+
+
+def _cache_raster_name(inputs: dict[str, object]) -> str:
+    polarizations = _cache_polarizations(inputs)
+    if polarizations == ("VV",):
+        return SNAP_CACHE_RASTER_NAME
+    suffix = "_".join(value.lower() for value in polarizations)
+    return f"sigma0_{suffix}.tif"
 
 
 def resolve_safe_product(path_value: str) -> SafeProduct:
@@ -612,29 +644,51 @@ def run_gpt(command: list[str], log_path: Path, description: str) -> None:
         )
 
 
-def validate_sigma0_raster(path: Path) -> None:
+def validate_sigma0_raster(
+    path: Path,
+    polarizations: tuple[str, ...] = ("VV",),
+) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise InferenceError(f"SNAP did not create the expected raster: {path}")
 
     with rasterio.open(path) as dataset:
-        AlignedRasterPair._validate_source(dataset, "SNAP output")
-        description = (dataset.descriptions[0] or "").upper().replace("-", "_")
-        if description and "SIGMA0_VV" not in description:
+        expected = tuple(str(value).upper() for value in polarizations)
+        if dataset.count != len(expected):
             raise InferenceError(
-                f"Unexpected SNAP output band '{dataset.descriptions[0]}'; "
-                "expected linear Sigma0_VV."
+                f"Unexpected SNAP output band count {dataset.count}; expected "
+                f"{len(expected)} linear Sigma0 bands in order {expected}."
             )
+        if dataset.crs is None:
+            raise InferenceError("The SNAP output raster has no CRS.")
+        if dataset.width <= 0 or dataset.height <= 0:
+            raise InferenceError("The SNAP output raster is empty.")
+        if abs(dataset.transform.a) <= 0 or abs(dataset.transform.e) <= 0:
+            raise InferenceError("The SNAP output raster has an invalid transform.")
+        for band_index, polarization in enumerate(expected):
+            raw_description = dataset.descriptions[band_index]
+            description = (raw_description or "").upper().replace("-", "_")
+            expected_description = f"SIGMA0_{polarization}"
+            if description and expected_description not in description:
+                raise InferenceError(
+                    f"Unexpected SNAP output band {band_index + 1} "
+                    f"'{raw_description}'; expected {expected_description}."
+                )
         sample_height = min(dataset.height, 1024)
         sample_width = min(dataset.width, 1024)
         sample = dataset.read(
-            1,
+            list(range(1, len(expected) + 1)),
             out_shape=(sample_height, sample_width),
             out_dtype="float32",
             resampling=Resampling.nearest,
         )
-        if not np.any(np.isfinite(sample) & (sample > 0)):
+        valid_by_band = np.any(
+            np.isfinite(sample) & (sample > 0),
+            axis=(1, 2),
+        )
+        if not bool(valid_by_band.all()):
             raise InferenceError(
-                f"SNAP output has no finite positive Sigma0 samples: {path}"
+                "SNAP output has no finite positive Sigma0 samples for every "
+                f"expected band {expected}: {path}"
             )
 
 
@@ -662,14 +716,20 @@ def _sampled_sha256_file(path: Path, sample_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def _safe_source_inventory(product: SafeProduct) -> list[dict[str, object]]:
+def _safe_source_inventory(
+    product: SafeProduct,
+    polarizations: tuple[str, ...] = ("VV",),
+) -> list[dict[str, object]]:
     inventory: list[dict[str, object]] = []
     measurement_dir = product.root / "measurement"
     annotation_dir = product.root / "annotation"
 
     if measurement_dir.is_dir():
         for path in sorted(measurement_dir.rglob("*")):
-            if path.is_file() and _is_vv_measurement(path):
+            if path.is_file() and any(
+                _is_polarization_measurement(path, polarization)
+                for polarization in polarizations
+            ):
                 inventory.append(
                     {
                         "path": path.relative_to(product.root).as_posix(),
@@ -703,11 +763,15 @@ def build_snap_cache_key(
     args: argparse.Namespace,
 ) -> tuple[str, dict[str, object]]:
     gpt_path = Path(gpt).resolve()
+    polarizations = _expected_polarizations(args)
     inputs: dict[str, object] = {
         "schema_version": SNAP_CACHE_SCHEMA_VERSION,
         "product_identifier": product.identifier,
         "manifest_sha256": _sha256_file(product.manifest),
-        "safe_source_inventory": _safe_source_inventory(product),
+        "safe_source_inventory": _safe_source_inventory(
+            product,
+            polarizations,
+        ),
         "graph_sha256": _sha256_file(graph),
         "gpt_path": str(gpt_path),
         "gpt_sha256": _sha256_file(gpt_path),
@@ -716,6 +780,10 @@ def build_snap_cache_key(
         "target_crs": args.target_crs,
         "pixel_spacing": format(float(args.pixel_spacing), ".12g"),
     }
+    # Preserve existing VV-only cache keys. Dual-polarization entries carry an
+    # explicit contract and use a semantic cache filename.
+    if polarizations != ("VV",):
+        inputs["polarizations"] = list(polarizations)
     serialized = json.dumps(
         inputs,
         sort_keys=True,
@@ -791,7 +859,7 @@ def load_snap_cache_entry(
 
     complete_path = generation / SNAP_CACHE_COMPLETE_NAME
     meta_path = generation / SNAP_CACHE_META_NAME
-    raster_path = generation / SNAP_CACHE_RASTER_NAME
+    raster_path = generation / _cache_raster_name(expected_inputs)
     if not complete_path.is_file() or not meta_path.is_file():
         return None
     if not raster_path.is_file() or raster_path.stat().st_size == 0:
@@ -809,7 +877,10 @@ def load_snap_cache_entry(
             return None
         if metadata.get("raster_size") != raster_path.stat().st_size:
             return None
-        validate_sigma0_raster(raster_path)
+        validate_sigma0_raster(
+            raster_path,
+            _cache_polarizations(expected_inputs),
+        )
     except (
         InferenceError,
         OSError,
@@ -859,9 +930,9 @@ def install_snap_cache_entry(
     )
     current_temp: Path | None = None
     try:
-        raster_path = partial_dir / SNAP_CACHE_RASTER_NAME
+        raster_path = partial_dir / _cache_raster_name(inputs)
         build(raster_path)
-        validate_sigma0_raster(raster_path)
+        validate_sigma0_raster(raster_path, _cache_polarizations(inputs))
         metadata = {
             "schema_version": SNAP_CACHE_SCHEMA_VERSION,
             "cache_key": cache_key,
@@ -888,7 +959,7 @@ def install_snap_cache_entry(
         os.symlink(target, current_temp)
         os.replace(current_temp, current_path)
         current_temp = None
-        return generation_dir / SNAP_CACHE_RASTER_NAME
+        return generation_dir / _cache_raster_name(inputs)
     finally:
         if partial_dir.exists():
             shutil.rmtree(partial_dir)
@@ -990,7 +1061,7 @@ def preprocess_safe(
                 "or obtain the original SAFE product, then rerun inference."
             ) from exc
         raise
-    validate_sigma0_raster(output)
+    validate_sigma0_raster(output, _expected_polarizations(args))
 
 
 def sigma0_to_model_intensity(

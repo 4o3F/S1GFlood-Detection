@@ -25,22 +25,25 @@ class StaticScheduler:
     def state_dict(self):
         return {}
 
+    def load_state_dict(self, state):
+        pass
+
 
 class TinyWaterModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = nn.Conv2d(1, 2, kernel_size=1)
+        self.encoder = nn.Conv2d(2, 2, kernel_size=1)
         self.head = nn.Conv2d(2, 2, kernel_size=1)
-        self.register_buffer('vv_mean', torch.zeros(1, 1, 1, 1))
-        self.register_buffer('vv_std', torch.ones(1, 1, 1, 1))
+        self.register_buffer('channel_mean', torch.zeros(1, 2, 1, 1))
+        self.register_buffer('channel_std', torch.ones(1, 2, 1, 1))
 
-    def set_vv_normalization(self, mean, std):
-        self.vv_mean.fill_(float(mean))
-        self.vv_std.fill_(float(std))
+    def set_channel_normalization(self, means, stds):
+        self.channel_mean.copy_(torch.tensor(means).view(1, 2, 1, 1))
+        self.channel_std.copy_(torch.tensor(stds).view(1, 2, 1, 1))
         return self
 
     def forward(self, image):
-        image = (image - self.vv_mean) / self.vv_std
+        image = (image - self.channel_mean) / self.channel_std
         return self.head(self.encoder(image))
 
 
@@ -93,7 +96,7 @@ def _loader():
     images = torch.tensor([
         [[[-25.0, -10.0], [-10.0, -25.0]]],
         [[[-10.0, -25.0], [-25.0, -10.0]]],
-    ])
+    ]).repeat(1, 2, 1, 1)
     targets = torch.tensor([
         [[0, 1], [1, 0]],
         [[1, 0], [0, 1]],
@@ -124,8 +127,8 @@ class WaterCliTest(unittest.TestCase):
                 'water_seg.train.build_kulsary_scene_index',
                 return_value=fake_index,
             ), patch(
-                'water_seg.train.compute_train_vv_stats',
-                return_value=(-15.0, 5.0),
+                'water_seg.train.compute_train_channel_stats',
+                return_value=([-15.0, -20.0], [5.0, 4.0]),
             ), patch(
                 'water_seg.train.SwinTinyUNet',
                 return_value=TinyWaterModel(),
@@ -154,8 +157,11 @@ class WaterCliTest(unittest.TestCase):
                 map_location='cpu',
                 weights_only=True,
             )
-            self.assertEqual(checkpoint['format_version'], 2)
-            self.assertEqual(checkpoint['config']['vv_mean'], -15.0)
+            self.assertEqual(checkpoint['format_version'], 3)
+            self.assertEqual(
+                checkpoint['config']['channel_mean'],
+                [-15.0, -20.0],
+            )
             self.assertFalse(checkpoint['config']['distributed'])
             self.assertEqual(checkpoint['config']['world_size'], 1)
             self.assertEqual(checkpoint['config']['global_batch_size'], 2)
@@ -216,8 +222,8 @@ class WaterCliTest(unittest.TestCase):
                 'water_seg.train.build_kulsary_scene_index',
                 return_value=fake_index,
             ), patch(
-                'water_seg.train.compute_train_vv_stats',
-                return_value=(-15.0, 5.0),
+                'water_seg.train.compute_train_channel_stats',
+                return_value=([-15.0, -20.0], [5.0, 4.0]),
             ), patch(
                 'water_seg.train.SwinTinyUNet',
                 return_value=TinyWaterModel(),
@@ -257,6 +263,101 @@ class WaterCliTest(unittest.TestCase):
             self.assertEqual(best['epoch'], 1)
             self.assertEqual(last['epoch'], 3)
             self.assertEqual(last['best_water_iou'], 0.5)
+
+    def test_resume_restores_full_state_and_starts_at_next_epoch(self):
+        metrics = {
+            'loss': 0.5,
+            'overall_accuracy': 0.5,
+            'precision': 0.5,
+            'recall': 0.5,
+            'f1': 0.5,
+            'water_iou': 0.5,
+            'samples': 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            save_dir = Path(directory) / 'run'
+            fake_index = FakeIndex(directory)
+            args = _data_args(directory) + [
+                '--epochs', '3',
+                '--batch-size', '2',
+                '--num-workers', '0',
+                '--device', 'cpu',
+                '--no-imagenet-pretrained',
+                '--no-augmentation',
+                '--no-progress',
+                '--early-stopping-patience', '0',
+                '--save-dir', str(save_dir),
+            ]
+            common_patches = (
+                patch(
+                    'water_seg.train.build_kulsary_scene_index',
+                    return_value=fake_index,
+                ),
+                patch(
+                    'water_seg.train.compute_train_channel_stats',
+                    return_value=([-15.0, -20.0], [5.0, 4.0]),
+                ),
+                patch(
+                    'water_seg.train.SwinTinyUNet',
+                    side_effect=lambda **kwargs: TinyWaterModel(),
+                ),
+                patch(
+                    'water_seg.train.get_water_loaders',
+                    return_value=(object(), object()),
+                ),
+                patch(
+                    'water_seg.train.torch.optim.lr_scheduler.CosineAnnealingLR',
+                    StaticScheduler,
+                ),
+            )
+            with common_patches[0], common_patches[1], common_patches[2], \
+                    common_patches[3], common_patches[4], patch(
+                        'water_seg.train.run_epoch',
+                        side_effect=[metrics, metrics, RuntimeError('interrupt')],
+                    ):
+                with self.assertRaisesRegex(RuntimeError, 'interrupt'):
+                    water_train.main(args)
+
+            interrupted = torch.load(
+                save_dir / 'last.pth',
+                map_location='cpu',
+                weights_only=True,
+            )
+            self.assertEqual(interrupted['epoch'], 1)
+            self.assertEqual(interrupted['best_epoch'], 1)
+            self.assertEqual(len(interrupted['rng_states']), 1)
+
+            with patch(
+                'water_seg.train.build_kulsary_scene_index',
+                return_value=fake_index,
+            ), patch(
+                'water_seg.train.compute_train_channel_stats',
+                return_value=([-15.0, -20.0], [5.0, 4.0]),
+            ), patch(
+                'water_seg.train.SwinTinyUNet',
+                side_effect=lambda **kwargs: TinyWaterModel(),
+            ), patch(
+                'water_seg.train.get_water_loaders',
+                return_value=(object(), object()),
+            ), patch(
+                'water_seg.train.torch.optim.lr_scheduler.CosineAnnealingLR',
+                StaticScheduler,
+            ), patch(
+                'water_seg.train.run_epoch',
+                side_effect=[metrics, metrics, metrics, metrics],
+            ) as resumed_epoch:
+                water_train.main(
+                    args + ['--resume', str(save_dir / 'last.pth')]
+                )
+
+            resumed = torch.load(
+                save_dir / 'last.pth',
+                map_location='cpu',
+                weights_only=True,
+            )
+            self.assertEqual(resumed_epoch.call_count, 4)
+            self.assertEqual(resumed['epoch'], 3)
+            self.assertEqual(resumed['config']['resume']['epoch'], 1)
 
     def test_cli_requires_raw_paths_and_rejects_dataset_dir(self):
         with self.assertRaises(SystemExit):

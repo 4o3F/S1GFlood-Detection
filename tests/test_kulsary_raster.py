@@ -59,7 +59,7 @@ def write_sigma0(
     *,
     crs: str = "EPSG:4326",
     nodata: float = 0.0,
-    count: int = 1,
+    count: int = 2,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
@@ -76,7 +76,11 @@ def write_sigma0(
     ) as dataset:
         for band in range(1, count + 1):
             dataset.write(array.astype(np.float32), band)
-            dataset.set_band_description(band, "Sigma0_VV")
+            if band <= 2:
+                dataset.set_band_description(
+                    band,
+                    ("Sigma0_VV", "Sigma0_VH")[band - 1],
+                )
 
 
 def dummy_mask_ref(size: tuple[int, int], transform: Affine) -> MaskRef:
@@ -138,9 +142,19 @@ class CommonGridAndReadTest(RasterFixtureTest):
             peak, peak_valid = stack.read_role("peak", window)
             before, before_valid = stack.read_role("before", window)
             arrays_all, valid = stack.read(window)
-            np.testing.assert_allclose(peak, arrays["peak"], atol=1e-6)
-            np.testing.assert_allclose(before, arrays["before"], atol=1e-6)
-            np.testing.assert_allclose(arrays_all["after"], arrays["after"], atol=1e-6)
+            np.testing.assert_allclose(peak[0], arrays["peak"], atol=1e-6)
+            np.testing.assert_allclose(peak[1], arrays["peak"], atol=1e-6)
+            for channel in range(2):
+                np.testing.assert_allclose(
+                    before[channel],
+                    arrays["before"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    arrays_all["after"][channel],
+                    arrays["after"],
+                    atol=1e-6,
+                )
             self.assertTrue(peak_valid.all())
             self.assertTrue(before_valid.all())
             self.assertTrue(valid.all())
@@ -175,7 +189,9 @@ class CommonGridAndReadTest(RasterFixtureTest):
             self.assertEqual(int(stack.grid.peak_window.row_off), 128)
             peak, valid = stack.read_role("peak", Window(0, 0, 256, 256))
             self.assertTrue(valid.all())
-            np.testing.assert_allclose(peak, arrays["peak"][128:384, 128:384], atol=1e-6)
+            expected = arrays["peak"][128:384, 128:384]
+            np.testing.assert_allclose(peak[0], expected, atol=1e-6)
+            np.testing.assert_allclose(peak[1], expected, atol=1e-6)
 
             with Sigma0Stack(paths, grid=stack.grid) as reused:
                 reused_peak, reused_valid = reused.read_role(
@@ -233,7 +249,7 @@ class CommonGridAndReadTest(RasterFixtureTest):
             paths["peak"],
             arrays["peak"],
             self.transform,
-            count=2,
+            count=3,
         )
         mask_ref = dummy_mask_ref((size, size), self.transform)
         with self.assertRaises(ValueError):

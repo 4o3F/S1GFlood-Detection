@@ -51,10 +51,15 @@ def write_safe(
     *,
     relative_orbit: int = 159,
     orbit_pass: str = "ASCENDING",
+    polarizations=("VV", "VH"),
 ) -> None:
     path.mkdir(parents=True)
     (path / "measurement").mkdir()
-    (path / "measurement" / "synthetic-vv-scene.tiff").write_bytes(b"vv")
+    for polarization in polarizations:
+        lower = polarization.lower()
+        (path / "measurement" / f"synthetic-{lower}-scene.tiff").write_bytes(
+            lower.encode("ascii")
+        )
     start = f"{acquisition_date}T14:14:44.000000Z"
     stop = f"{acquisition_date}T14:15:10.000000Z"
     (path / "manifest.safe").write_text(
@@ -67,9 +72,12 @@ def write_safe(
             f"<pass>{orbit_pass}</pass>"
             f'<relativeOrbitNumber type="start">{relative_orbit}'
             "</relativeOrbitNumber>"
-            "<transmitterReceiverPolarisation>VV"
-            "</transmitterReceiverPolarisation>"
-            "</root>"
+            + "".join(
+                "<transmitterReceiverPolarisation>"
+                f"{polarization}</transmitterReceiverPolarisation>"
+                for polarization in polarizations
+            )
+            + "</root>"
         ),
         encoding="utf-8",
     )

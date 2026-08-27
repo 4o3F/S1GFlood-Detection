@@ -14,7 +14,9 @@ from utils.parser import (epoch_count, finite_float, nonnegative_float,
 from water_seg.engine import (INPUT_CONTRACT, NORMALIZATION_CONTRACT,
                               build_optimizer, checkpoint_payload,
                               cleanup_distributed, close_loader,
+                              collect_rng_states,
                               initialize_distributed, run_epoch,
+                              load_checkpoint_file, restore_training_state,
                               save_checkpoint, seed_everything,
                               set_loader_epoch, synchronize_model_buffers,
                               unwrap_model, wrap_distributed_model)
@@ -25,7 +27,8 @@ from water_seg.geoid_dataset import (GEOID_IGNORE_INDEX,
                                      build_geoid_water_index,
                                      get_geoid_water_loaders,
                                      validate_geoid_files)
-from water_seg.geoid_stats import GEOID_VV_STATS
+from water_seg.geoid_stats import GEOID_CHANNEL_STATS
+from utils.kulsary_raster import POLARIZATIONS
 from water_seg.model import SwinTinyUNet
 
 
@@ -35,7 +38,7 @@ GEOID_REFERENCE_COMMIT = 'b0ab63540a2a331513be306a5cbdc4ba88c766f5'
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            'Pretrain the single-temporal VV Swin-T U-Net on GEOID-Flood'
+            'Pretrain the single-temporal VV+VH Swin-T U-Net on GEOID-Flood'
         )
     )
     parser.add_argument('--geoid-root', type=Path, required=True)
@@ -68,8 +71,20 @@ def build_parser():
         default=0.0,
     )
     parser.add_argument('--seed', type=nonnegative_int, default=42)
-    parser.add_argument('--save-dir', default='.tmp/geoid_swin_tiny_unet')
+    parser.add_argument(
+        '--save-dir',
+        default='.tmp/geoid_swin_tiny_unet_vv_vh',
+    )
     parser.add_argument('--device', default=None)
+    parser.add_argument(
+        '--resume',
+        type=Path,
+        default=None,
+        help=(
+            'resume complete training state from a format-2 GEOID checkpoint; '
+            'all training/data options, including --epochs, must match'
+        ),
+    )
     parser.add_argument(
         '--validate-only',
         action='store_true',
@@ -91,7 +106,7 @@ def build_parser():
         '--imagenet-pretrained',
         action=argparse.BooleanOptionalAction,
         default=True,
-        help='initialize the one-channel Swin-T encoder from ImageNet weights',
+        help='initialize the two-channel Swin-T encoder from ImageNet weights',
     )
     return parser
 
@@ -103,16 +118,17 @@ def _validate_options(options):
         raise ValueError('--min-valid-proportion must be between 0 and 1')
 
 
-def _load_geoid_vv_constants(index):
-    stats = GEOID_VV_STATS
+def _load_geoid_channel_constants(index):
+    stats = GEOID_CHANNEL_STATS
     if not isinstance(stats, dict):
         raise RuntimeError(
-            'GEOID VV constants are not generated; run '
+            'GEOID VV+VH constants are not generated; run '
             '`python -m water_seg.compute_geoid_stats --geoid-root PATH` first'
         )
     required = {
-        'vv_mean',
-        'vv_std',
+        'polarizations',
+        'channel_mean',
+        'channel_std',
         'db_min',
         'db_max',
         'min_valid_proportion',
@@ -121,7 +137,13 @@ def _load_geoid_vv_constants(index):
     }
     missing = sorted(required - stats.keys())
     if missing:
-        raise ValueError(f'GEOID VV constants are missing fields: {missing}')
+        raise ValueError(
+            f'GEOID VV+VH constants are missing fields: {missing}'
+        )
+    if tuple(stats['polarizations']) != POLARIZATIONS:
+        raise ValueError(
+            f'GEOID polarizations must be {POLARIZATIONS}'
+        )
     counts = index.counts()
     expected = {
         'db_min': index.db_min,
@@ -133,23 +155,27 @@ def _load_geoid_vv_constants(index):
     for key, expected_value in expected.items():
         if stats[key] != expected_value:
             raise ValueError(
-                f'GEOID VV constants do not match current {key}; regenerate '
+                f'GEOID VV+VH constants do not match current {key}; regenerate '
                 'them with water_seg.compute_geoid_stats'
             )
-    vv_mean = float(stats['vv_mean'])
-    vv_std = float(stats['vv_std'])
-    if not math.isfinite(vv_mean):
-        raise ValueError('GEOID VV mean constant must be finite')
-    if not math.isfinite(vv_std) or vv_std <= 0:
-        raise ValueError('GEOID VV std constant must be finite and positive')
-    return vv_mean, vv_std
+    channel_mean = [float(value) for value in stats['channel_mean']]
+    channel_std = [float(value) for value in stats['channel_std']]
+    if len(channel_mean) != len(POLARIZATIONS) or not all(
+        math.isfinite(value) for value in channel_mean
+    ):
+        raise ValueError('GEOID channel mean constants are invalid')
+    if len(channel_std) != len(POLARIZATIONS) or not all(
+        math.isfinite(value) and value > 0 for value in channel_std
+    ):
+        raise ValueError('GEOID channel std constants are invalid')
+    return channel_mean, channel_std
 
 
 def _serializable_config(
     options,
     index,
-    vv_mean,
-    vv_std,
+    channel_mean,
+    channel_std,
     file_inventory,
     distributed_context,
 ):
@@ -173,13 +199,17 @@ def _serializable_config(
         'seed': options.seed,
         'augmentation': options.augmentation,
         'progress': options.progress,
-        'imagenet_pretrained': options.imagenet_pretrained,
+        'imagenet_pretrained': (
+            options.imagenet_pretrained and options.resume is None
+        ),
+        'imagenet_pretrained_requested': options.imagenet_pretrained,
         'architecture': 'SwinTinyUNet',
         'input': INPUT_CONTRACT,
-        'in_chans': 1,
+        'in_chans': len(POLARIZATIONS),
+        'polarizations': list(POLARIZATIONS),
         'normalization': NORMALIZATION_CONTRACT,
-        'vv_mean': float(vv_mean),
-        'vv_std': float(vv_std),
+        'channel_mean': [float(value) for value in channel_mean],
+        'channel_std': [float(value) for value in channel_std],
         'db_min': index.db_min,
         'db_max': index.db_max,
         'geoid_root': str(index.root),
@@ -188,7 +218,7 @@ def _serializable_config(
         'file_inventory': dict(file_inventory),
         'min_valid_proportion': index.min_valid_proportion,
         'modality': 's1grd',
-        'band': 'VV',
+        'bands': list(POLARIZATIONS),
         'image_scope': ['pre', 'post'],
         'ignore_index': GEOID_IGNORE_INDEX,
         'label_mapping': {
@@ -236,6 +266,9 @@ def _pretraining_payload(
     train_metrics,
     val_metrics,
     config,
+    best_epoch,
+    checks_without_improvement,
+    rng_states,
 ):
     payload = checkpoint_payload(
         model,
@@ -246,9 +279,12 @@ def _pretraining_payload(
         train_metrics,
         val_metrics,
         config,
+        best_epoch=best_epoch,
+        checks_without_improvement=checks_without_improvement,
+        rng_states=rng_states,
+        format_version=GEOID_PRETRAINING_FORMAT_VERSION,
     )
     payload['kind'] = GEOID_PRETRAINING_KIND
-    payload['format_version'] = GEOID_PRETRAINING_FORMAT_VERSION
     return payload
 
 
@@ -283,12 +319,14 @@ def _run(options, distributed_context):
         if distributed_context.is_main:
             print('GEOID S1-GRD/label selection is complete.')
         return None
-    vv_mean, vv_std = _load_geoid_vv_constants(index)
+    channel_mean, channel_std = _load_geoid_channel_constants(index)
     model = SwinTinyUNet(
         imagenet_pretrained=(
-            options.imagenet_pretrained and distributed_context.is_main
+            options.imagenet_pretrained
+            and options.resume is None
+            and distributed_context.is_main
         ),
-    ).set_vv_normalization(vv_mean, vv_std).to(device)
+    ).set_channel_normalization(channel_mean, channel_std).to(device)
     train_loader, val_loader = get_geoid_water_loaders(
         index,
         batch_size=options.batch_size,
@@ -313,8 +351,8 @@ def _run(options, distributed_context):
     config = _serializable_config(
         options,
         index,
-        vv_mean,
-        vv_std,
+        channel_mean,
+        channel_std,
         file_inventory,
         distributed_context,
     )
@@ -322,8 +360,8 @@ def _run(options, distributed_context):
         print(json.dumps({'dataset': {
             'samples_per_split': config['samples_per_split'],
             'samples_per_time': config['samples_per_time'],
-            'vv_mean': config['vv_mean'],
-            'vv_std': config['vv_std'],
+            'channel_mean': config['channel_mean'],
+            'channel_std': config['channel_std'],
             'ignored_label': config['ignore_index'],
             'world_size': config['world_size'],
             'global_batch_size': config['global_batch_size'],
@@ -334,13 +372,49 @@ def _run(options, distributed_context):
         SummaryWriter(str(save_dir / 'log' / timestamp))
         if distributed_context.is_main else None
     )
+    start_epoch = 1
     best_water_iou = float('-inf')
     best_epoch = None
     checks_without_improvement = 0
+    if options.resume is not None:
+        resume_path = options.resume.expanduser().resolve()
+        resume_checkpoint = load_checkpoint_file(resume_path)
+        resume_state = restore_training_state(
+            resume_checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            config,
+            distributed_context,
+            expected_format_version=GEOID_PRETRAINING_FORMAT_VERSION,
+            expected_kind=GEOID_PRETRAINING_KIND,
+            expected_architecture='SwinTinyUNet',
+        )
+        start_epoch = resume_state['start_epoch']
+        best_water_iou = resume_state['best_water_iou']
+        best_epoch = resume_state['best_epoch']
+        checks_without_improvement = resume_state[
+            'checks_without_improvement'
+        ]
+        config['resume'] = {
+            'path': str(resume_path),
+            'fingerprint': sampled_file_fingerprint(resume_path),
+            'epoch': int(resume_checkpoint['epoch']),
+        }
+        if start_epoch > options.epochs:
+            raise ValueError(
+                f'--epochs={options.epochs} must be at least the next resume '
+                f'epoch {start_epoch}'
+            )
+        if distributed_context.is_main:
+            print(
+                f'Resuming GEOID pretraining at epoch {start_epoch} from '
+                f'{resume_path}'
+            )
     stop_reason = f'reached the maximum of {options.epochs} epochs'
 
     try:
-        for epoch in range(1, options.epochs + 1):
+        for epoch in range(start_epoch, options.epochs + 1):
             set_loader_epoch(train_loader, epoch)
             train_metrics = run_epoch(
                 training_model,
@@ -383,6 +457,7 @@ def _run(options, distributed_context):
                 checks_without_improvement += 1
 
             scheduler.step()
+            rng_states = collect_rng_states(distributed_context)
             if distributed_context.is_main:
                 payload = _pretraining_payload(
                     unwrap_model(training_model),
@@ -393,6 +468,9 @@ def _run(options, distributed_context):
                     train_metrics,
                     val_metrics,
                     config,
+                    best_epoch,
+                    checks_without_improvement,
+                    rng_states,
                 )
                 save_checkpoint(save_dir / 'last.pth', payload)
                 if improved:

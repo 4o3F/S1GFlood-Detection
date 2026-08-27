@@ -1,4 +1,4 @@
-"""Publish three stable Kulsary Sigma0 VV GeoTIFFs from restored GRD SAFE."""
+"""Publish three stable Kulsary Sigma0 VV+VH GeoTIFFs from restored GRD SAFE."""
 
 from __future__ import annotations
 
@@ -29,15 +29,22 @@ from utils.kulsary_raster import sampled_file_fingerprint
 from utils.kulsary_temporal import ROLE_DATES
 
 
-PREPROCESSOR_VERSION = "1.0.0"
+PREPROCESSOR_VERSION = "2.0.0"
+POLARIZATIONS = ("VV", "VH")
+BAND_ORDER = {polarization: index for index, polarization in enumerate(
+    POLARIZATIONS,
+    start=1,
+)}
 DEFAULT_WORK_DIR = Path.home() / "scratch" / "damnet-safe"
-DEFAULT_GRAPH = Path(__file__).resolve().parent / "snap" / "s1_grd_preprocess.xml"
+DEFAULT_GRAPH = (
+    Path(__file__).resolve().parent / "snap" / "s1_grd_preprocess_vv_vh.xml"
+)
 DEFAULT_ORBIT_TYPE = "Sentinel Precise (Auto Download)"
 DEFAULT_DEM_NAME = "Copernicus 30m Global DEM"
 OUTPUT_FILENAMES = {
-    "before": "before_sigma0_vv.tif",
-    "peak": "peak_sigma0_vv.tif",
-    "after": "after_sigma0_vv.tif",
+    "before": "before_sigma0_vv_vh.tif",
+    "peak": "peak_sigma0_vv_vh.tif",
+    "after": "after_sigma0_vv_vh.tif",
 }
 MANIFEST_FILENAME = "sigma0_manifest.json"
 _LINK_FALLBACK_ERRNOS = {
@@ -53,7 +60,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Preprocess restored Kulsary GRD SAFE products into three stable "
-            "linear Sigma0 VV GeoTIFFs."
+            "two-band linear Sigma0 VV+VH GeoTIFFs."
         )
     )
     parser.add_argument("--safe-root", type=Path, required=True)
@@ -86,6 +93,7 @@ def _is_within(path: Path, root: Path) -> bool:
 def _validate_args(args: argparse.Namespace) -> None:
     if not math.isfinite(args.pixel_spacing) or args.pixel_spacing <= 0:
         raise ValueError("--pixel-spacing must be finite and positive")
+    args.polarizations = POLARIZATIONS
 
 
 def _resolve_paths(args: argparse.Namespace):
@@ -224,6 +232,8 @@ def _build_manifest(
     return {
         "format": "kulsary-sigma0",
         "version": PREPROCESSOR_VERSION,
+        "polarizations": list(POLARIZATIONS),
+        "band_order": dict(BAND_ORDER),
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "safe_root": str(safe_root),
         "roles": roles,
@@ -249,12 +259,16 @@ def _verify_staging(staging: Path) -> None:
             f"found {sorted(actual)}"
         )
     for filename in OUTPUT_FILENAMES.values():
-        validate_sigma0_raster(staging / filename)
+        validate_sigma0_raster(staging / filename, POLARIZATIONS)
     manifest = json.loads(
         (staging / MANIFEST_FILENAME).read_text(encoding="utf-8")
     )
     if manifest.get("format") != "kulsary-sigma0":
         raise RuntimeError("Sigma0 manifest format is invalid")
+    if manifest.get("polarizations") != list(POLARIZATIONS):
+        raise RuntimeError("Sigma0 manifest polarizations are invalid")
+    if manifest.get("band_order") != BAND_ORDER:
+        raise RuntimeError("Sigma0 manifest band order is invalid")
     roles = manifest.get("roles")
     if not isinstance(roles, dict) or set(roles) != set(OUTPUT_FILENAMES):
         raise RuntimeError("Sigma0 manifest roles are invalid")
@@ -268,7 +282,10 @@ def _verify_staging(staging: Path) -> None:
 def prepare(args: argparse.Namespace) -> dict:
     _validate_args(args)
     safe_root, output, work_dir, graph, cache_root, staging = _resolve_paths(args)
-    products = discover_kulsary_grd_products(safe_root)
+    products = discover_kulsary_grd_products(
+        safe_root,
+        required_polarizations=POLARIZATIONS,
+    )
 
     dry_run_gpt = _find_gpt_for_dry_run(args.gpt)
     cache_status = _probe_cache(
@@ -304,7 +321,7 @@ def prepare(args: argparse.Namespace) -> dict:
             args,
         )
         for path in source_paths.values():
-            validate_sigma0_raster(path)
+            validate_sigma0_raster(path, POLARIZATIONS)
 
         staging.mkdir(parents=True)
         try:
@@ -312,7 +329,7 @@ def prepare(args: argparse.Namespace) -> dict:
             for role in ROLE_DATES:
                 destination = staging / OUTPUT_FILENAMES[role]
                 methods[role] = _publish_raster(source_paths[role], destination)
-                validate_sigma0_raster(destination)
+                validate_sigma0_raster(destination, POLARIZATIONS)
             manifest = _build_manifest(
                 safe_root,
                 graph,

@@ -411,7 +411,7 @@ You can download our novel public S1GFloods dataset through the following link:
 
 - Standalone single-temporal Kulsary water segmentation
 
-  The VV-only Swin-T + U-Net under [`water_seg/`](water_seg/README.md) uses a
+  The VV+VH Swin-T + U-Net under [`water_seg/`](water_seg/README.md) uses a
   two-stage workflow. First publish three stable linear-Sigma0 GeoTIFFs from
   the restored standard GRD SAFE tree; then train directly from that Sigma0
   root and the original PNG+PGW masks. Each valid tile contributes `before`,
@@ -420,15 +420,15 @@ You can download our novel public S1GFloods dataset through the following link:
   ```shell
   uv run python prepare_kulsary_sigma0.py \
     --safe-root /home/ubuntu/lhx/Sentinel1-SAR/restored_grd \
-    --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+    --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
     --gpt /usr/local/esa-snap/bin/gpt
 
   uv run python -m water_seg.train \
-    --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+    --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
     --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks
 
   uv run python -m water_seg.eval \
-    --path .tmp/water_swin_tiny_unet/best.pth
+    --path .tmp/water_swin_tiny_unet_vv_vh/best.pth
   ```
 
   The preprocessing script collapses duplicate top-level/`products/` SAFE
@@ -437,7 +437,7 @@ You can download our novel public S1GFloods dataset through the following link:
   memory, computes normalization from the train split only, and never runs
   SNAP in the DataLoader. See the module README for complete contracts.
 
-  Optional GEOID-Flood VV pretraining uses the release CSV directly and then
+  Optional GEOID-Flood VV+VH pretraining uses the release CSV directly and then
   transfers weights into the Kulsary run:
 
   ```shell
@@ -445,24 +445,29 @@ You can download our novel public S1GFloods dataset through the following link:
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
 
   # Single GPU
-  uv run python -m water_seg.pretrain_geoid \
-    --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
+  CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.pretrain_geoid \
+    --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
+    --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
 
   # Two GPUs (use instead of the single-GPU command)
   CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
     --standalone --nproc_per_node=2 \
     -m water_seg.pretrain_geoid \
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
-    --batch-size 8 --num-workers 2
+    --batch-size 8 --num-workers 2 \
+    --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
 
   uv run python -m water_seg.train \
-    --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+    --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
     --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
-    --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth
+    --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh/best.pth
   ```
 
-  This adapter reads only `s1grd` band-1 VV and `label` windows referenced by
-  `data_tiles_s256_st128.csv`; other GEOID modalities are not required.
+  This adapter reads `s1grd` bands 1/2 in `[VV,VH]` order and `label` windows
+  referenced by `data_tiles_s256_st128.csv`; other GEOID modalities are not
+  required. Both training commands save `last.pth` after every epoch and accept
+  `--resume path/to/last.pth`; see the module README for the strict resume
+  contract.
 
 - Testing
 

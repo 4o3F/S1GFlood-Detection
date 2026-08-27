@@ -32,7 +32,7 @@ from water_seg.dataset import (
     KulsaryRawWaterDataset,
     RandomD4,
     build_kulsary_scene_index,
-    compute_train_vv_stats,
+    compute_train_channel_stats,
     get_water_loaders,
     get_water_test_loader,
     resolve_sigma0_paths,
@@ -85,20 +85,24 @@ def write_mask(path: Path, array: np.ndarray, transform: Affine) -> None:
 
 def write_sigma0(path: Path, array: np.ndarray, transform: Affine) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    source = np.asarray(array, dtype=np.float32)
+    if source.ndim == 2:
+        source = np.stack((source, source), axis=0)
     with rasterio.open(
         path,
         'w',
         driver='GTiff',
-        width=array.shape[1],
-        height=array.shape[0],
-        count=1,
+        width=source.shape[2],
+        height=source.shape[1],
+        count=2,
         dtype='float32',
         crs='EPSG:4326',
         transform=transform,
         nodata=0.0,
     ) as dataset:
-        dataset.write(array.astype(np.float32), 1)
+        dataset.write(source)
         dataset.set_band_description(1, 'Sigma0_VV')
+        dataset.set_band_description(2, 'Sigma0_VH')
 
 
 def distinctive_water_masks(size: int = SCENE_SIZE) -> dict[str, np.ndarray]:
@@ -128,7 +132,7 @@ class KulsarySceneFixtureTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.sigma0_paths = {
-            role: self.root / f'{role}_sigma0_vv.tif' for role in ROLES
+            role: self.root / f'{role}_sigma0_vv_vh.tif' for role in ROLES
         }
         self.mask_source = self.root / 'masks'
         self.mask_source.mkdir()
@@ -191,7 +195,9 @@ class Sigma0RootResolutionTest(KulsarySceneFixtureTest):
         (sigma0_root / SIGMA0_MANIFEST_FILENAME).write_text(
             json.dumps({
                 'format': 'kulsary-sigma0',
-                'version': '1.0.0',
+                'version': '2.0.0',
+                'polarizations': ['VV', 'VH'],
+                'band_order': {'VV': 1, 'VH': 2},
                 'roles': roles,
             }),
             encoding='utf-8',
@@ -209,7 +215,7 @@ class Sigma0RootResolutionTest(KulsarySceneFixtureTest):
             },
         )
         self.assertEqual(provenance['input_mode'], 'sigma0-root')
-        self.assertEqual(provenance['sigma0_manifest_version'], '1.0.0')
+        self.assertEqual(provenance['sigma0_manifest_version'], '2.0.0')
 
     def test_explicit_paths_remain_supported(self):
         paths, provenance = resolve_sigma0_paths(
@@ -305,14 +311,14 @@ class DatasetOutputTest(KulsarySceneFixtureTest):
             for sample_index, sample in enumerate(dataset.samples):
                 image, mask, name = dataset[sample_index]
                 self.assertEqual(name, sample.name)
-                self.assertEqual(tuple(image.shape), (1, PATCH_SIZE, PATCH_SIZE))
+                self.assertEqual(tuple(image.shape), (2, PATCH_SIZE, PATCH_SIZE))
                 self.assertEqual(tuple(mask.shape), (PATCH_SIZE, PATCH_SIZE))
                 self.assertEqual(image.dtype, torch.float32)
                 self.assertEqual(mask.dtype, torch.int64)
                 torch.testing.assert_close(
                     image,
                     torch.full(
-                        (1, PATCH_SIZE, PATCH_SIZE),
+                        (2, PATCH_SIZE, PATCH_SIZE),
                         ROLE_DB[sample.role],
                         dtype=torch.float32,
                     ),
@@ -360,7 +366,7 @@ class DatasetOutputTest(KulsarySceneFixtureTest):
         val_dataset = val_loader.dataset
         with patch.object(RandomD4, '__call__', side_effect=AssertionError('D4')):
             image, mask, name = val_dataset[0]
-        self.assertEqual(tuple(image.shape), (1, PATCH_SIZE, PATCH_SIZE))
+        self.assertEqual(tuple(image.shape), (2, PATCH_SIZE, PATCH_SIZE))
         with patch.object(RandomD4, '__call__', side_effect=AssertionError('D4')):
             test_loader.dataset[0]
 
@@ -375,7 +381,7 @@ class DatasetOutputTest(KulsarySceneFixtureTest):
         ):
             image, mask, name = dataset[0]
         self.assertEqual(name, sample.name)
-        self.assertEqual(tuple(image.shape), (1, PATCH_SIZE, PATCH_SIZE))
+        self.assertEqual(tuple(image.shape), (2, PATCH_SIZE, PATCH_SIZE))
 
 
 class RandomD4Test(unittest.TestCase):
@@ -398,6 +404,27 @@ class RandomD4Test(unittest.TestCase):
             results.append(np.ascontiguousarray(out_image).tobytes())
 
         self.assertEqual(len(set(results)), 8)
+
+    def test_dual_channel_transform_uses_the_same_spatial_operation(self):
+        vv = np.zeros((4, 4), dtype=np.float32)
+        vv[0, 1] = 1.0
+        vh = vv * 7.0
+        image = np.stack((vv, vh), axis=0)
+        mask = (vv > 0).astype(np.int64)
+
+        for choice in range(8):
+            with self.subTest(choice=choice), patch(
+                'water_seg.dataset.random.randrange',
+                return_value=choice,
+            ):
+                out_image, out_mask = RandomD4()(image, mask)
+            self.assertEqual(out_image.shape, (2, 4, 4))
+            self.assertEqual(out_mask.shape, (4, 4))
+            np.testing.assert_array_equal(
+                out_image[0] != 0,
+                out_mask.astype(bool),
+            )
+            np.testing.assert_array_equal(out_image[1], out_image[0] * 7.0)
 
     def test_non_square_arrays_are_rejected(self):
         image = np.zeros((4, 5), dtype=np.float32)
@@ -430,7 +457,7 @@ class TrainStatsTest(KulsarySceneFixtureTest):
         for role, array in arrays.items():
             write_sigma0(self.sigma0_paths[role], array, TRANSFORM)
 
-        mean, std = compute_train_vv_stats(index)
+        means, stds = compute_train_channel_stats(index)
         train_db = np.array(
             [
                 float(linear_sigma0_to_clipped_db(
@@ -446,8 +473,11 @@ class TrainStatsTest(KulsarySceneFixtureTest):
         expected_mean = float(train_db.mean())
         expected_std = float(train_db.std())
         self.assertGreater(expected_std, 0.0)
-        self.assertAlmostEqual(mean, expected_mean, places=4)
-        self.assertAlmostEqual(std, expected_std, places=4)
+        self.assertEqual(len(means), 2)
+        self.assertEqual(len(stds), 2)
+        for mean, std in zip(means, stds):
+            self.assertAlmostEqual(mean, expected_mean, places=4)
+            self.assertAlmostEqual(std, expected_std, places=4)
 
         all_values = []
         for split_name in index.split_by_tile.values():
@@ -456,7 +486,7 @@ class TrainStatsTest(KulsarySceneFixtureTest):
             else:
                 all_values.extend([0.0, 0.0, 0.0])
         mixed_mean = float(np.mean(all_values))
-        self.assertNotAlmostEqual(mean, mixed_mean, places=2)
+        self.assertNotAlmostEqual(means[0], mixed_mean, places=2)
 
 
 class LoaderTest(KulsarySceneFixtureTest):
@@ -483,7 +513,7 @@ class LoaderTest(KulsarySceneFixtureTest):
         for loader in (train_loader, val_loader, test_loader):
             images, masks, names = next(iter(loader))
             self.assertEqual(images.shape[0], min(2, len(loader.dataset)))
-            self.assertEqual(tuple(images.shape[1:]), (1, PATCH_SIZE, PATCH_SIZE))
+            self.assertEqual(tuple(images.shape[1:]), (2, PATCH_SIZE, PATCH_SIZE))
             self.assertEqual(tuple(masks.shape[1:]), (PATCH_SIZE, PATCH_SIZE))
             self.assertEqual(images.dtype, torch.float32)
             self.assertEqual(masks.dtype, torch.int64)
@@ -516,7 +546,7 @@ class LoaderTest(KulsarySceneFixtureTest):
         self.assertIs(train_loader.worker_init_fn, water_worker_init_fn)
         self.assertIs(val_loader.worker_init_fn, water_worker_init_fn)
         worker_images, worker_masks, worker_names = next(iter(train_loader))
-        self.assertEqual(tuple(worker_images.shape[1:]), (1, PATCH_SIZE, PATCH_SIZE))
+        self.assertEqual(tuple(worker_images.shape[1:]), (2, PATCH_SIZE, PATCH_SIZE))
         self.assertEqual(tuple(worker_masks.shape[1:]), (PATCH_SIZE, PATCH_SIZE))
         self.assertEqual(len(worker_names), worker_images.shape[0])
 

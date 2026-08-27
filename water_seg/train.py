@@ -8,18 +8,21 @@ import torch
 import torch.nn as nn
 from tensorboardX import SummaryWriter
 
-from utils.kulsary_raster import sampled_file_fingerprint
+from utils.kulsary_raster import POLARIZATIONS, sampled_file_fingerprint
 from utils.parser import (epoch_count, finite_float, nonnegative_float,
                           nonnegative_int, positive_int)
 from water_seg.dataset import (build_kulsary_scene_index,
-                               compute_train_vv_stats, get_water_loaders,
+                               compute_train_channel_stats, get_water_loaders,
                                grid_signature, resolve_sigma0_paths,
                                source_fingerprints, tile_split_records)
 from water_seg.engine import (INPUT_CONTRACT, NORMALIZATION_CONTRACT,
                               build_optimizer, checkpoint_payload,
                               cleanup_distributed, close_loader,
+                              collect_rng_states,
                               initialize_distributed,
-                              load_initial_model_weights, run_epoch,
+                              load_checkpoint_file,
+                              load_initial_model_weights,
+                              restore_training_state, run_epoch,
                               save_checkpoint, seed_everything,
                               set_loader_epoch, synchronize_model_buffers,
                               unwrap_model, wrap_distributed_model)
@@ -31,7 +34,7 @@ GEOID_REFERENCE_COMMIT = 'b0ab63540a2a331513be306a5cbdc4ba88c766f5'
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description='Train a single-temporal Kulsary VV Swin-T U-Net'
+        description='Train a single-temporal Kulsary VV+VH Swin-T U-Net'
     )
     parser.add_argument('--sigma0-root', type=Path, default=None)
     parser.add_argument('--sigma0-before', type=Path, default=None)
@@ -55,7 +58,10 @@ def build_parser():
     parser.add_argument('--early-stopping-patience', type=nonnegative_int, default=5)
     parser.add_argument('--min-iou-improvement', type=nonnegative_float, default=0.0)
     parser.add_argument('--seed', type=nonnegative_int, default=42)
-    parser.add_argument('--save-dir', default='.tmp/water_swin_tiny_unet')
+    parser.add_argument(
+        '--save-dir',
+        default='.tmp/water_swin_tiny_unet_vv_vh',
+    )
     parser.add_argument('--device', default=None)
     parser.add_argument(
         '--init-checkpoint',
@@ -63,7 +69,16 @@ def build_parser():
         default=None,
         help=(
             'initialize model weights from water_seg GEOID pretraining or a '
-            'compatible format-2 Kulsary checkpoint'
+            'compatible format-3 Kulsary checkpoint'
+        ),
+    )
+    parser.add_argument(
+        '--resume',
+        type=Path,
+        default=None,
+        help=(
+            'resume complete training state from a format-3 Kulsary '
+            'checkpoint; all training/data options must match'
         ),
     )
     parser.add_argument(
@@ -82,12 +97,14 @@ def build_parser():
         '--imagenet-pretrained',
         action=argparse.BooleanOptionalAction,
         default=True,
-        help='initialize the one-channel Swin-T encoder from ImageNet weights',
+        help='initialize the two-channel Swin-T encoder from ImageNet weights',
     )
     return parser
 
 
 def _validate_data_options(options):
+    if options.init_checkpoint is not None and options.resume is not None:
+        raise ValueError('--init-checkpoint cannot be combined with --resume')
     if options.db_min >= options.db_max:
         raise ValueError('--db-min must be smaller than --db-max')
     ratios = (
@@ -111,8 +128,8 @@ def _samples_per_split(index):
 def _serializable_config(
     options,
     index,
-    vv_mean,
-    vv_std,
+    channel_mean,
+    channel_std,
     input_provenance,
     initialization,
     distributed_context,
@@ -137,16 +154,19 @@ def _serializable_config(
         'augmentation': options.augmentation,
         'progress': options.progress,
         'imagenet_pretrained': (
-            options.imagenet_pretrained and options.init_checkpoint is None
+            options.imagenet_pretrained
+            and options.init_checkpoint is None
+            and options.resume is None
         ),
         'imagenet_pretrained_requested': options.imagenet_pretrained,
         'initialization': initialization,
         'architecture': 'SwinTinyUNet',
         'input': INPUT_CONTRACT,
-        'in_chans': 1,
+        'in_chans': len(POLARIZATIONS),
+        'polarizations': list(POLARIZATIONS),
         'normalization': NORMALIZATION_CONTRACT,
-        'vv_mean': float(vv_mean),
-        'vv_std': float(vv_std),
+        'channel_mean': [float(value) for value in channel_mean],
+        'channel_std': [float(value) for value in channel_std],
         'db_min': index.db_min,
         'db_max': index.db_max,
         'sigma0_before': str(index.sigma0_paths['before']),
@@ -217,16 +237,28 @@ def _run(options, distributed_context):
         test_ratio=options.test_ratio,
         split_seed=options.split_seed,
     )
-    vv_mean, vv_std = compute_train_vv_stats(index)
+    channel_mean, channel_std = compute_train_channel_stats(index)
+    resume_checkpoint = None
+    resume_path = None
+    if options.resume is not None:
+        resume_path = options.resume.expanduser().resolve()
+        resume_checkpoint = load_checkpoint_file(resume_path)
     use_imagenet_initialization = (
-        options.imagenet_pretrained and options.init_checkpoint is None
+        options.imagenet_pretrained
+        and options.init_checkpoint is None
+        and resume_checkpoint is None
     )
     model = SwinTinyUNet(
         imagenet_pretrained=(
             use_imagenet_initialization and distributed_context.is_main
         ),
     )
-    initialization = None
+    initialization = (
+        resume_checkpoint['config'].get('initialization')
+        if resume_checkpoint is not None
+        and isinstance(resume_checkpoint.get('config'), dict)
+        else None
+    )
     if options.init_checkpoint is not None:
         init_path = options.init_checkpoint.expanduser().resolve()
         if not init_path.is_file():
@@ -246,7 +278,7 @@ def _run(options, distributed_context):
             'format_version': init_checkpoint.get('format_version'),
             'epoch': init_checkpoint.get('epoch'),
         }
-    model.set_vv_normalization(vv_mean, vv_std).to(device)
+    model.set_channel_normalization(channel_mean, channel_std).to(device)
     train_loader, val_loader = get_water_loaders(
         index,
         batch_size=options.batch_size,
@@ -272,8 +304,8 @@ def _run(options, distributed_context):
     config = _serializable_config(
         options,
         index,
-        vv_mean,
-        vv_std,
+        channel_mean,
+        channel_std,
         input_provenance,
         initialization,
         distributed_context,
@@ -283,8 +315,8 @@ def _run(options, distributed_context):
             'dataset': {
                 'kept_tiles': config['kept_tile_count'],
                 'samples_per_split': config['samples_per_split'],
-                'vv_mean': config['vv_mean'],
-                'vv_std': config['vv_std'],
+                'channel_mean': config['channel_mean'],
+                'channel_std': config['channel_std'],
                 'world_size': config['world_size'],
                 'global_batch_size': config['global_batch_size'],
             }
@@ -295,13 +327,47 @@ def _run(options, distributed_context):
         SummaryWriter(str(save_dir / 'log' / timestamp))
         if distributed_context.is_main else None
     )
+    start_epoch = 1
     best_water_iou = float('-inf')
     best_epoch = None
     checks_without_improvement = 0
+    if resume_checkpoint is not None:
+        resume_state = restore_training_state(
+            resume_checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            config,
+            distributed_context,
+            expected_format_version=3,
+            expected_architecture='SwinTinyUNet',
+            validate_kulsary_config=True,
+        )
+        start_epoch = resume_state['start_epoch']
+        best_water_iou = resume_state['best_water_iou']
+        best_epoch = resume_state['best_epoch']
+        checks_without_improvement = resume_state[
+            'checks_without_improvement'
+        ]
+        config['resume'] = {
+            'path': str(resume_path),
+            'fingerprint': sampled_file_fingerprint(resume_path),
+            'epoch': int(resume_checkpoint['epoch']),
+        }
+        if start_epoch > options.epochs:
+            raise ValueError(
+                f'--epochs={options.epochs} must be at least the next resume '
+                f'epoch {start_epoch}'
+            )
+        if distributed_context.is_main:
+            print(
+                f'Resuming Kulsary training at epoch {start_epoch} from '
+                f'{resume_path}'
+            )
     stop_reason = f'reached the maximum of {options.epochs} epochs'
 
     try:
-        for epoch in range(1, options.epochs + 1):
+        for epoch in range(start_epoch, options.epochs + 1):
             set_loader_epoch(train_loader, epoch)
             train_metrics = run_epoch(
                 training_model,
@@ -344,6 +410,7 @@ def _run(options, distributed_context):
                 checks_without_improvement += 1
 
             scheduler.step()
+            rng_states = collect_rng_states(distributed_context)
             if distributed_context.is_main:
                 payload = checkpoint_payload(
                     unwrap_model(training_model),
@@ -354,6 +421,9 @@ def _run(options, distributed_context):
                     train_metrics,
                     val_metrics,
                     config,
+                    best_epoch=best_epoch,
+                    checks_without_improvement=checks_without_improvement,
+                    rng_states=rng_states,
                 )
                 save_checkpoint(save_dir / 'last.pth', payload)
                 if improved:

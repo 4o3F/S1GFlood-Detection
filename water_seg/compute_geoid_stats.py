@@ -9,8 +9,9 @@ from utils.kulsary_raster import sampled_file_fingerprint
 from utils.parser import finite_float
 from water_seg.geoid_dataset import (GEOID_METADATA_FILENAME,
                                      build_geoid_water_index,
-                                     compute_geoid_train_vv_stats,
+                                     compute_geoid_train_channel_stats,
                                      validate_geoid_files)
+from utils.kulsary_raster import POLARIZATIONS
 
 
 DEFAULT_OUTPUT = Path(__file__).with_name('geoid_stats.py')
@@ -19,7 +20,7 @@ DEFAULT_OUTPUT = Path(__file__).with_name('geoid_stats.py')
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            'Scan GEOID train windows once and write VV constants for '
+            'Scan GEOID train windows once and write VV+VH constants for '
             'pretraining'
         )
     )
@@ -59,11 +60,11 @@ def _validate_options(options):
 def _render_constants(stats):
     rendered = pprint.pformat(stats, sort_dicts=True, width=88)
     return (
-        '"""Generated GEOID VV normalization constants.\n\n'
+        '"""Generated GEOID VV+VH normalization constants.\n\n'
         'Regenerate with ``python -m water_seg.compute_geoid_stats`` when '
         'the metadata selection or radiometry contract changes.\n'
         '"""\n\n\n'
-        f'GEOID_VV_STATS = {rendered}\n'
+        f'GEOID_CHANNEL_STATS = {rendered}\n'
     )
 
 
@@ -110,13 +111,14 @@ def main(argv=None):
         },
         **file_inventory,
     }}, sort_keys=True))
-    vv_mean, vv_std = compute_geoid_train_vv_stats(
+    channel_mean, channel_std = compute_geoid_train_channel_stats(
         index,
         progress=options.progress,
     )
     stats = {
-        'vv_mean': float(vv_mean),
-        'vv_std': float(vv_std),
+        'polarizations': list(POLARIZATIONS),
+        'channel_mean': [float(value) for value in channel_mean],
+        'channel_std': [float(value) for value in channel_std],
         'db_min': index.db_min,
         'db_max': index.db_max,
         'min_valid_proportion': index.min_valid_proportion,
@@ -126,8 +128,8 @@ def main(argv=None):
         'label_files': file_inventory['label_files'],
     }
     output = _write_constants(options.output, stats)
-    print(json.dumps({'geoid_vv_stats': stats}, sort_keys=True))
-    print(f'Wrote GEOID VV constants: {output}')
+    print(json.dumps({'geoid_channel_stats': stats}, sort_keys=True))
+    print(f'Wrote GEOID VV+VH constants: {output}')
     return output
 
 

@@ -13,8 +13,8 @@ from swin_transformer import swin
 from water_seg.model import DecoderBlock, SwinTinyEncoder, SwinTinyUNet
 
 
-def _clipped_db_vv(batch=1, height=64, width=64):
-    return torch.empty(batch, 1, height, width).uniform_(-32.0, 0.0)
+def _clipped_db_channels(batch=1, height=64, width=64):
+    return torch.empty(batch, 2, height, width).uniform_(-32.0, 0.0)
 
 
 class SwinTinyEncoderInitTest(unittest.TestCase):
@@ -36,14 +36,14 @@ class SwinTinyEncoderInitTest(unittest.TestCase):
             module_load.assert_not_called()
         self.assertEqual(list(encoder.num_features), [96, 192, 384, 768])
 
-    def test_patch_embed_uses_single_channel_stem(self):
+    def test_patch_embed_uses_dual_channel_stem(self):
         source = inspect.getsource(SwinTinyEncoder.__init__)
-        self.assertIn('in_chans=1', source)
+        self.assertIn('in_chans=len(_POLARIZATIONS)', source)
         self.assertNotIn('in_chans=3', source)
         encoder = SwinTinyEncoder()
-        self.assertEqual(encoder.patch_embed.in_chans, 1)
-        self.assertEqual(encoder.patch_embed.proj.in_channels, 1)
-        self.assertEqual(tuple(encoder.patch_embed.proj.weight.shape), (96, 1, 4, 4))
+        self.assertEqual(encoder.patch_embed.in_chans, 2)
+        self.assertEqual(encoder.patch_embed.proj.in_channels, 2)
+        self.assertEqual(tuple(encoder.patch_embed.proj.weight.shape), (96, 2, 4, 4))
 
 
 class SwinTinyUNetTest(unittest.TestCase):
@@ -60,11 +60,11 @@ class SwinTinyUNetTest(unittest.TestCase):
             any(name.startswith('encoder.') for name, _ in self.model.named_parameters())
         )
 
-    def test_encoder_patch_embed_in_chans_is_one(self):
-        self.assertEqual(self.model.encoder.patch_embed.in_chans, 1)
+    def test_encoder_patch_embed_in_chans_is_two(self):
+        self.assertEqual(self.model.encoder.patch_embed.in_chans, 2)
 
     def test_encoder_stage_channels(self):
-        features = self.model.encoder(torch.rand(1, 1, 64, 64))
+        features = self.model.encoder(torch.rand(1, 2, 64, 64))
         self.assertEqual(len(features), 4)
         for feature, channels, stride in zip(
             features,
@@ -74,13 +74,15 @@ class SwinTinyUNetTest(unittest.TestCase):
             self.assertEqual(tuple(feature.shape), (1, channels, 64 // stride, 64 // stride))
 
     def test_forward_returns_full_resolution_logits(self):
-        image = _clipped_db_vv()
+        image = _clipped_db_channels()
         with torch.no_grad():
             logits = self.model(image)
         self.assertIsInstance(logits, torch.Tensor)
         self.assertEqual(tuple(logits.shape), (1, 2, 64, 64))
 
-    def test_rejects_three_channel_input(self):
+    def test_rejects_wrong_channel_count(self):
+        with self.assertRaises(ValueError):
+            self.model(torch.rand(1, 1, 64, 64))
         with self.assertRaises(ValueError):
             self.model(torch.rand(1, 3, 64, 64))
 
@@ -89,8 +91,6 @@ class SwinTinyUNetTest(unittest.TestCase):
             self.model(torch.rand(1, 64, 64))
         with self.assertRaises(ValueError):
             self.model(torch.rand(64, 64))
-        with self.assertRaises(ValueError):
-            self.model(torch.rand(1, 2, 64, 64))
 
     def test_decoder_outputs_are_512_256_128_64(self):
         self.assertEqual(self.model.dec1.out_channels, 512)
@@ -116,17 +116,23 @@ class SwinTinyUNetTest(unittest.TestCase):
         ]
         try:
             with torch.no_grad():
-                self.model(_clipped_db_vv())
+                self.model(_clipped_db_channels())
         finally:
             for hook in hooks:
                 hook.remove()
         self.assertEqual(channels, [512, 256, 128, 64])
 
-    def test_has_vv_buffers_and_no_imagenet_or_repeat_behavior(self):
-        self.assertEqual(tuple(self.model.vv_mean.shape), (1, 1, 1, 1))
-        self.assertEqual(tuple(self.model.vv_std.shape), (1, 1, 1, 1))
-        torch.testing.assert_close(self.model.vv_mean, torch.zeros(1, 1, 1, 1))
-        torch.testing.assert_close(self.model.vv_std, torch.ones(1, 1, 1, 1))
+    def test_has_channel_buffers_and_no_imagenet_or_repeat_behavior(self):
+        self.assertEqual(tuple(self.model.channel_mean.shape), (1, 2, 1, 1))
+        self.assertEqual(tuple(self.model.channel_std.shape), (1, 2, 1, 1))
+        torch.testing.assert_close(
+            self.model.channel_mean,
+            torch.zeros(1, 2, 1, 1),
+        )
+        torch.testing.assert_close(
+            self.model.channel_std,
+            torch.ones(1, 2, 1, 1),
+        )
         self.assertFalse(hasattr(self.model, 'imagenet_mean'))
         self.assertFalse(hasattr(self.model, 'imagenet_std'))
         source = inspect.getsource(SwinTinyUNet)
@@ -135,63 +141,75 @@ class SwinTinyUNetTest(unittest.TestCase):
         self.assertNotIn('/255', source.replace(' ', ''))
         self.assertNotIn('repeat(', source)
 
-    def test_set_vv_normalization_updates_and_rejects_invalid_values(self):
+    def test_set_channel_normalization_updates_and_rejects_invalid_values(self):
         model = SwinTinyUNet(imagenet_pretrained=False)
-        returned = model.set_vv_normalization(-12.5, 4.0)
+        returned = model.set_channel_normalization([-12.5, -18.0], [4.0, 3.0])
         self.assertIs(returned, model)
         torch.testing.assert_close(
-            model.vv_mean, torch.tensor(-12.5).view(1, 1, 1, 1)
+            model.channel_mean,
+            torch.tensor([-12.5, -18.0]).view(1, 2, 1, 1),
         )
         torch.testing.assert_close(
-            model.vv_std, torch.tensor(4.0).view(1, 1, 1, 1)
+            model.channel_std,
+            torch.tensor([4.0, 3.0]).view(1, 2, 1, 1),
         )
-        for mean, std in (
-            (0.0, 0.0),
-            (0.0, -1.0),
-            (float('nan'), 1.0),
-            (float('inf'), 1.0),
-            (0.0, float('nan')),
-            (0.0, float('inf')),
-            (-math.inf, 1.0),
-            (0.0, -math.inf),
+        for means, stds in (
+            ([0.0], [1.0, 1.0]),
+            ([0.0, 0.0], [1.0]),
+            ([0.0, 0.0], [0.0, 1.0]),
+            ([float('nan'), 0.0], [1.0, 1.0]),
+            ([float('inf'), 0.0], [1.0, 1.0]),
+            ([0.0, 0.0], [float('nan'), 1.0]),
+            ([0.0, 0.0], [float('inf'), 1.0]),
+            ([-math.inf, 0.0], [1.0, 1.0]),
+            ([0.0, 0.0], [-math.inf, 1.0]),
         ):
             with self.assertRaises(ValueError):
-                model.set_vv_normalization(mean, std)
+                model.set_channel_normalization(means, stds)
 
-    def test_vv_normalization_changes_prepared_and_forward_values(self):
+    def test_channel_normalization_changes_prepared_and_forward_values(self):
         model = SwinTinyUNet(imagenet_pretrained=False).eval()
-        image = torch.linspace(-32.0, 0.0, 64 * 64, dtype=torch.float32).view(
-            1, 1, 64, 64
-        )
+        image = torch.linspace(
+            -32.0,
+            0.0,
+            2 * 64 * 64,
+            dtype=torch.float32,
+        ).view(1, 2, 64, 64)
         default_prepared = model._prepare_input(image)
         torch.testing.assert_close(default_prepared, image)
         with torch.no_grad():
             default_logits = model(image)
 
-        model.set_vv_normalization(-16.0, 8.0)
+        model.set_channel_normalization([-16.0, -20.0], [8.0, 4.0])
         prepared = model._prepare_input(image)
-        torch.testing.assert_close(prepared, (image - (-16.0)) / 8.0)
-        self.assertEqual(prepared.dtype, model.vv_mean.dtype)
-        self.assertEqual(prepared.device, model.vv_mean.device)
+        torch.testing.assert_close(
+            prepared,
+            (image - model.channel_mean) / model.channel_std,
+        )
+        self.assertEqual(prepared.dtype, model.channel_mean.dtype)
+        self.assertEqual(prepared.device, model.channel_mean.device)
         with torch.no_grad():
             normalized_logits = model(image)
             again = model(image)
         self.assertFalse(torch.allclose(normalized_logits, default_logits))
         torch.testing.assert_close(again, normalized_logits)
 
-    def test_state_dict_round_trip_preserves_vv_stats_and_logits(self):
+    def test_state_dict_round_trip_preserves_channel_stats_and_logits(self):
         model = SwinTinyUNet(imagenet_pretrained=False).eval()
-        model.set_vv_normalization(-15.0, 8.0)
-        image = torch.linspace(-32.0, 0.0, 64 * 64, dtype=torch.float32).view(
-            1, 1, 64, 64
-        )
+        model.set_channel_normalization([-15.0, -20.0], [8.0, 4.0])
+        image = torch.linspace(
+            -32.0,
+            0.0,
+            2 * 64 * 64,
+            dtype=torch.float32,
+        ).view(1, 2, 64, 64)
         with torch.no_grad():
             original = model(image)
         clone = SwinTinyUNet(imagenet_pretrained=False)
         clone.load_state_dict(model.state_dict())
         clone.eval()
-        torch.testing.assert_close(clone.vv_mean, model.vv_mean)
-        torch.testing.assert_close(clone.vv_std, model.vv_std)
+        torch.testing.assert_close(clone.channel_mean, model.channel_mean)
+        torch.testing.assert_close(clone.channel_std, model.channel_std)
         with torch.no_grad():
             restored = clone(image)
         torch.testing.assert_close(restored, original)
@@ -223,8 +241,8 @@ class ImageNetPretrainedLoadTest(unittest.TestCase):
 
         source_state = source.state_dict()
         loaded = model.encoder.state_dict()
-        adapted_stem = adapt_input_conv(1, source_state['patch_embed.proj.weight'])
-        self.assertEqual(tuple(loaded['patch_embed.proj.weight'].shape), (96, 1, 4, 4))
+        adapted_stem = adapt_input_conv(2, source_state['patch_embed.proj.weight'])
+        self.assertEqual(tuple(loaded['patch_embed.proj.weight'].shape), (96, 2, 4, 4))
         torch.testing.assert_close(
             loaded['patch_embed.proj.weight'],
             adapted_stem,

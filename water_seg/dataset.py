@@ -12,6 +12,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from utils.kulsary_raster import (
     PATCH_SIZE,
+    POLARIZATIONS,
     CommonGrid,
     LazySigma0Stack,
     Sigma0Stack,
@@ -43,9 +44,9 @@ _D4_FLIP_UD = 5
 _D4_TRANSPOSE = 6
 _D4_TRANSVERSE = 7
 SIGMA0_ROOT_FILENAMES = {
-    'before': 'before_sigma0_vv.tif',
-    'peak': 'peak_sigma0_vv.tif',
-    'after': 'after_sigma0_vv.tif',
+    'before': 'before_sigma0_vv_vh.tif',
+    'peak': 'peak_sigma0_vv_vh.tif',
+    'after': 'after_sigma0_vv_vh.tif',
 }
 SIGMA0_MANIFEST_FILENAME = 'sigma0_manifest.json'
 
@@ -97,6 +98,7 @@ def resolve_sigma0_paths(
             'sigma0_root': None,
             'sigma0_manifest': None,
             'sigma0_manifest_version': None,
+            'polarizations': list(POLARIZATIONS),
         }
 
     root = _require_directory(sigma0_root, kind='Sigma0 dataset directory')
@@ -109,6 +111,18 @@ def resolve_sigma0_paths(
         raise ValueError(f'could not read Sigma0 manifest: {manifest_path}') from exc
     if not isinstance(manifest, dict) or manifest.get('format') != 'kulsary-sigma0':
         raise ValueError(f'invalid Kulsary Sigma0 manifest: {manifest_path}')
+    if manifest.get('polarizations') != list(POLARIZATIONS):
+        raise ValueError(
+            f'Sigma0 manifest must declare polarizations {POLARIZATIONS}'
+        )
+    expected_band_order = {
+        polarization: index
+        for index, polarization in enumerate(POLARIZATIONS, start=1)
+    }
+    if manifest.get('band_order') != expected_band_order:
+        raise ValueError(
+            f'Sigma0 manifest band order must be {expected_band_order}'
+        )
     roles = manifest.get('roles')
     if not isinstance(roles, dict) or set(roles) != set(SIGMA0_ROOT_FILENAMES):
         raise ValueError('Sigma0 manifest must contain before, peak, and after roles')
@@ -127,6 +141,7 @@ def resolve_sigma0_paths(
         'sigma0_root': str(root),
         'sigma0_manifest': str(manifest_path.resolve()),
         'sigma0_manifest_version': manifest.get('version'),
+        'polarizations': list(POLARIZATIONS),
     }
 
 
@@ -138,22 +153,26 @@ def _validate_db_range(db_min, db_max):
 
 
 def _apply_d4(array, op):
+    spatial_axes = (-2, -1)
     if op == _D4_IDENTITY:
         transformed = array
     elif op == _D4_ROT90:
-        transformed = np.rot90(array, 1)
+        transformed = np.rot90(array, 1, axes=spatial_axes)
     elif op == _D4_ROT180:
-        transformed = np.rot90(array, 2)
+        transformed = np.rot90(array, 2, axes=spatial_axes)
     elif op == _D4_ROT270:
-        transformed = np.rot90(array, 3)
+        transformed = np.rot90(array, 3, axes=spatial_axes)
     elif op == _D4_FLIP_LR:
-        transformed = np.fliplr(array)
+        transformed = np.flip(array, axis=-1)
     elif op == _D4_FLIP_UD:
-        transformed = np.flipud(array)
+        transformed = np.flip(array, axis=-2)
     elif op == _D4_TRANSPOSE:
-        transformed = array.T
+        transformed = np.swapaxes(array, -2, -1)
     elif op == _D4_TRANSVERSE:
-        transformed = np.fliplr(np.rot90(array, 1))
+        transformed = np.flip(
+            np.rot90(array, 1, axes=spatial_axes),
+            axis=-1,
+        )
     else:
         raise ValueError(f'unsupported D4 op: {op}')
     return np.ascontiguousarray(transformed)
@@ -346,8 +365,8 @@ def _assert_role_cardinality(kept_tiles, samples):
             )
 
 
-def compute_train_vv_stats(index):
-    """Population mean/std of clipped-dB VV over train samples only.
+def compute_train_channel_stats(index):
+    """Per-channel population statistics over Kulsary train samples only.
 
     Each train role-tile is read through ``LazySigma0Stack.read_role`` and
     converted with ``linear_sigma0_to_clipped_db``. Accumulators use a
@@ -357,11 +376,11 @@ def compute_train_vv_stats(index):
     """
     samples = index.samples_for('train')
     if not samples:
-        raise ValueError('no training samples are available for VV stats')
+        raise ValueError('no training samples are available for channel stats')
 
-    count = 0
-    mean = 0.0
-    second_moment = 0.0
+    counts = np.zeros(len(POLARIZATIONS), dtype=np.int64)
+    means = np.zeros(len(POLARIZATIONS), dtype=np.float64)
+    second_moments = np.zeros(len(POLARIZATIONS), dtype=np.float64)
     stack = LazySigma0Stack(index.sigma0_paths, index.grid)
     try:
         for sample in samples:
@@ -372,37 +391,46 @@ def compute_train_vv_stats(index):
                 index.db_min,
                 index.db_max,
             )
-            count, mean, second_moment = _welford_combine(
-                count,
-                mean,
-                second_moment,
-                clipped_db,
-            )
+            for channel in range(len(POLARIZATIONS)):
+                (
+                    counts[channel],
+                    means[channel],
+                    second_moments[channel],
+                ) = _welford_combine(
+                    int(counts[channel]),
+                    float(means[channel]),
+                    float(second_moments[channel]),
+                    clipped_db[channel],
+                )
     finally:
         stack.close()
 
-    if count <= 0:
-        raise ValueError('training VV stats received no pixels')
-    std = math.sqrt(second_moment / count)
-    if not math.isfinite(mean) or not math.isfinite(std) or std <= 0.0:
-        raise ValueError('training VV std must be finite and positive')
-    return float(mean), float(std)
+    if bool((counts <= 0).any()):
+        raise ValueError('training channel stats received no pixels')
+    stds = np.sqrt(second_moments / counts)
+    if not bool(np.isfinite(means).all()):
+        raise ValueError('training channel means must be finite')
+    if not bool(np.isfinite(stds).all()) or bool((stds <= 0.0).any()):
+        raise ValueError('training channel stds must be finite and positive')
+    return means.tolist(), stds.tolist()
 
 
 class RandomD4(object):
     def __call__(self, image, mask):
         image_array = np.asarray(image)
         mask_array = np.asarray(mask)
-        if image_array.ndim != 2 or mask_array.ndim != 2:
-            raise ValueError('D4 augmentation requires 2-D image and mask arrays')
-        if image_array.shape != mask_array.shape:
+        if image_array.ndim not in {2, 3} or mask_array.ndim != 2:
+            raise ValueError(
+                'D4 augmentation requires a 2-D/CHW image and 2-D mask'
+            )
+        if image_array.shape[-2:] != mask_array.shape:
             raise ValueError(
                 'image/mask shape mismatch for D4: '
                 f'{image_array.shape} vs {mask_array.shape}'
             )
-        if image_array.shape[0] != image_array.shape[1]:
+        if image_array.shape[-2] != image_array.shape[-1]:
             raise ValueError(
-                'D4 augmentation requires a square VV patch: '
+                'D4 augmentation requires square spatial dimensions: '
                 f'{image_array.shape}'
             )
         op = random.randrange(8)
@@ -423,12 +451,14 @@ class KulsaryRawWaterDataset(data.Dataset):
     def __getitem__(self, sample_index):
         sample = self.samples[sample_index]
         sigma0, valid = self._stack.read_role(sample.role, tile_window(sample.tile))
-        if sigma0.shape != (PATCH_SIZE, PATCH_SIZE):
+        expected_image_shape = (len(POLARIZATIONS), PATCH_SIZE, PATCH_SIZE)
+        if sigma0.shape != expected_image_shape:
             raise ValueError(
-                f'expected {PATCH_SIZE}x{PATCH_SIZE} Sigma0 tile for {sample.name}, '
+                f'expected {POLARIZATIONS} Sigma0 tile with shape '
+                f'{expected_image_shape} for {sample.name}, '
                 f'got {sigma0.shape}'
             )
-        if valid.shape != sigma0.shape or not bool(valid.all()):
+        if valid.shape != (PATCH_SIZE, PATCH_SIZE) or not bool(valid.all()):
             raise ValueError(f'Sigma0 tile is not fully valid for {sample.name}')
         image = linear_sigma0_to_clipped_db(
             sigma0,
@@ -449,7 +479,7 @@ class KulsaryRawWaterDataset(data.Dataset):
             image, mask = self._d4(image, mask)
         image_tensor = torch.from_numpy(
             np.ascontiguousarray(image, dtype=np.float32)
-        ).unsqueeze(0)
+        )
         mask_tensor = torch.from_numpy(np.asarray(mask, dtype=np.int64))
         return image_tensor, mask_tensor, sample.name
 

@@ -11,6 +11,7 @@ from swin_transformer import swin
 _TIMM_SWIN_TINY = 'swin_tiny_patch4_window7_224'
 _MIN_MATCHED_PRETRAINED_TENSORS = 100
 _PATCH_EMBED_WEIGHT = 'patch_embed.proj.weight'
+_POLARIZATIONS = ('VV', 'VH')
 
 
 def _is_ignored_pretrained_key(name):
@@ -37,7 +38,7 @@ def _load_timm_swin_tiny_weights(encoder):
         if dest is None:
             continue
         if name == _PATCH_EMBED_WEIGHT:
-            tensor = adapt_input_conv(1, tensor)
+            tensor = adapt_input_conv(len(_POLARIZATIONS), tensor)
         if dest.shape == tensor.shape:
             matched[destination_name] = tensor
     if len(matched) < _MIN_MATCHED_PRETRAINED_TENSORS:
@@ -53,7 +54,7 @@ class SwinTinyEncoder(swin):
     def __init__(self, imagenet_pretrained=False):
         super().__init__(
             None,
-            in_chans=1,
+            in_chans=len(_POLARIZATIONS),
             embed_dim=96,
             depths=(2, 2, 6, 2),
             num_heads=(3, 6, 12, 24),
@@ -129,28 +130,61 @@ class SwinTinyUNet(nn.Module):
         self.dec4 = DecoderBlock(128, 0, 64)
         self.dropout = nn.Dropout2d(0.3)
         self.head = nn.Conv2d(64, 2, kernel_size=1)
-        self.register_buffer('vv_mean', torch.zeros(1, 1, 1, 1))
-        self.register_buffer('vv_std', torch.ones(1, 1, 1, 1))
+        self.register_buffer(
+            'channel_mean',
+            torch.zeros(1, len(_POLARIZATIONS), 1, 1),
+        )
+        self.register_buffer(
+            'channel_std',
+            torch.ones(1, len(_POLARIZATIONS), 1, 1),
+        )
 
-    def set_vv_normalization(self, mean, std):
-        mean = float(mean)
-        std = float(std)
-        if not math.isfinite(mean):
-            raise ValueError(f'vv mean must be finite, got {mean}')
-        if not math.isfinite(std) or std <= 0:
-            raise ValueError(f'vv std must be finite and positive, got {std}')
-        self.vv_mean.fill_(mean)
-        self.vv_std.fill_(std)
+    def set_channel_normalization(self, means, stds):
+        means = tuple(float(value) for value in means)
+        stds = tuple(float(value) for value in stds)
+        if len(means) != len(_POLARIZATIONS):
+            raise ValueError(
+                f'channel means must follow {_POLARIZATIONS}, got {means}'
+            )
+        if len(stds) != len(_POLARIZATIONS):
+            raise ValueError(
+                f'channel stds must follow {_POLARIZATIONS}, got {stds}'
+            )
+        if not all(math.isfinite(value) for value in means):
+            raise ValueError(f'channel means must be finite, got {means}')
+        if not all(math.isfinite(value) and value > 0 for value in stds):
+            raise ValueError(
+                f'channel stds must be finite and positive, got {stds}'
+            )
+        self.channel_mean.copy_(
+            torch.tensor(means, dtype=self.channel_mean.dtype).view(
+                1,
+                len(_POLARIZATIONS),
+                1,
+                1,
+            )
+        )
+        self.channel_std.copy_(
+            torch.tensor(stds, dtype=self.channel_std.dtype).view(
+                1,
+                len(_POLARIZATIONS),
+                1,
+                1,
+            )
+        )
         return self
 
     def _prepare_input(self, x):
-        if x.ndim != 4 or x.size(1) != 1:
+        if x.ndim != 4 or x.size(1) != len(_POLARIZATIONS):
             raise ValueError(
-                'SwinTinyUNet expects a single VV channel of shape [B, 1, H, W], '
+                'SwinTinyUNet expects VV+VH channels in shape [B, 2, H, W], '
                 f'got {tuple(x.shape)}'
             )
-        x = x.to(device=self.vv_mean.device, dtype=self.vv_mean.dtype)
-        return (x - self.vv_mean) / self.vv_std
+        x = x.to(
+            device=self.channel_mean.device,
+            dtype=self.channel_mean.dtype,
+        )
+        return (x - self.channel_mean) / self.channel_std
 
     def forward(self, x):
         original_size = x.shape[-2:]

@@ -1,4 +1,4 @@
-# Single-Temporal VV Water Segmentation
+# Single-Temporal VV+VH Water Segmentation
 
 The target workflow remains Kulsary-only training/evaluation. An optional
 GEOID-Flood stage provides source-domain pretraining before Kulsary fine-tuning.
@@ -18,10 +18,11 @@ uv run python -m water_seg.pretrain_geoid \
 uv run python -m water_seg.compute_geoid_stats \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood
 
-uv run python -m water_seg.pretrain_geoid \
+CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.pretrain_geoid \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --batch-size 8 \
-  --num-workers 4
+  --num-workers 4 \
+  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
 ```
 
 For one machine with two GPUs, launch one process per visible GPU:
@@ -34,7 +35,7 @@ CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --batch-size 8 \
   --num-workers 2 \
-  --save-dir .tmp/geoid_swin_tiny_unet
+  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
 ```
 
 In DDP mode, `--batch-size` and `--num-workers` are per process/GPU. The command
@@ -46,8 +47,8 @@ and saves `best.pth`/`last.pth`. Checkpoints retain ordinary unwrapped model
 keys and are interchangeable with single-GPU runs.
 
 `compute_geoid_stats` is a one-time offline pass. It displays source-level
-progress, computes the exact train-window-weighted VV mean/std, and atomically
-replaces `water_seg/geoid_stats.py` with Python constants plus the metadata
+progress, computes exact train-window-weighted VV and VH mean/std values, and
+atomically replaces `water_seg/geoid_stats.py` with Python constants plus the metadata
 fingerprint, dB range, validity threshold, and train sample count. Pretraining
 never scans the imagery for statistics; it reads those constants and rejects
 them if their provenance does not match the current CSV selection. Regenerate
@@ -62,17 +63,20 @@ geoid-flood/<EMSR-event-AoI>/s1grd/<tile_id>.tif
 geoid-flood/<EMSR-event-AoI>/label/<label_id>.tif
 ```
 
-Only S1-GRD band 1 (VV), `train`/`val` rows, and `pre`/`post` images are used.
-The adapter does not read `s2l2a`, `s1rtc`, `dem`, `cloudmask`, or
+Only S1-GRD bands 1 and 2 in `[VV,VH]` order, `train`/`val` rows, and
+`pre`/`post` images are used. The adapter does not read `s2l2a`, `s1rtc`,
+`dem`, `cloudmask`, or
 `tile_catalog.parquet`, and it does not create another tiled dataset. A partial
 download is therefore valid if the CSV plus every referenced `s1grd` and
-`label` file is present.
+`label` file is present. No GEOID redownload or data conversion is required;
+the existing `s1grd` GeoTIFFs already provide the two source bands.
 
 GEOID labels use `0=background`, `1=permanent water`, `2=flood`, and
 `255=ignore`. For a single-temporal complete-water target, class 2 maps to
-background on `pre` images and to water on `post` images; 255 and invalid VV
-pixels are excluded from both cross-entropy and metrics. VV uses the same
-linear-Sigma0 to clipped `[-25,0]` dB contract as Kulsary, with normalization
+background on `pre` images and to water on `post` images; 255 and pixels invalid
+in either polarization are excluded from both cross-entropy and metrics. Both
+channels use the same linear-Sigma0 to clipped `[-25,0]` dB contract as
+Kulsary, with normalization
 statistics computed from valid GEOID training pixels only. The official
 256-pixel windows are retained instead of resized to 224.
 
@@ -80,13 +84,41 @@ Pretraining and fine-tuning remain epoch-based and validate after every epoch.
 Their train/validation loops display batch progress and current loss by default;
 use `--no-progress` only for non-interactive logging.
 
+Both commands write `last.pth` after every completed validation epoch. Resume
+restores model, optimizer, scheduler, best metric, early-stopping counter, and
+per-rank random-number state, then starts at the next epoch. Repeat the original
+data and training options (including the original `--epochs` value):
+
+```shell
+CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.pretrain_geoid \
+  --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
+  --batch-size 8 \
+  --num-workers 4 \
+  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh \
+  --resume .tmp/geoid_swin_tiny_unet_vv_vh/last.pth
+
+CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.train \
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
+  --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
+  --batch-size 8 \
+  --num-workers 0 \
+  --save-dir .tmp/water_swin_tiny_unet_vv_vh \
+  --resume .tmp/water_swin_tiny_unet_vv_vh/last.pth
+```
+
+Resume is intentionally epoch-boundary only: work in an interrupted partial
+epoch is repeated. Changing the dataset, world size, batch size, scheduler,
+augmentation, split, or epoch budget is rejected instead of silently creating
+a non-equivalent run. Old single-VV checkpoints cannot initialize or resume the
+two-channel model.
+
 Fine-tune the resulting model on Kulsary:
 
 ```shell
-uv run python -m water_seg.train \
-  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.train \
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
   --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
-  --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth
+  --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh/best.pth
 ```
 
 The same target fine-tuning can use both GPUs:
@@ -96,19 +128,20 @@ CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   -m water_seg.train \
-  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
   --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
-  --init-checkpoint .tmp/geoid_swin_tiny_unet/best.pth \
+  --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh/best.pth \
   --batch-size 4 \
   --num-workers 2
 ```
 
-`--init-checkpoint` restores model weights only. Kulsary train-split VV
+`--init-checkpoint` restores model weights only. Kulsary train-split per-channel
 normalization is then applied, and optimizer/scheduler state starts fresh.
 
 The Kulsary workflow has two explicit stages:
 
-1. restored Sentinel-1 GRD SAFE → stable linear `Sigma0_VV` GeoTIFF dataset;
+1. restored dual-pol Sentinel-1 GRD SAFE → stable two-band linear Sigma0
+   GeoTIFF dataset in `[VV,VH]` order;
 2. Sigma0 dataset + original PNG/PGW water masks → Swin-T U-Net training/evaluation.
 
 SNAP runs only in stage 1. The training DataLoader never reads SAFE products or invokes SNAP.
@@ -120,19 +153,23 @@ The restored root may contain top-level standard SAFEs and duplicate `products/`
 ```shell
 uv run python prepare_kulsary_sigma0.py \
   --safe-root /home/ubuntu/lhx/Sentinel1-SAR/restored_grd \
-  --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --output /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
   --gpt /usr/local/esa-snap/bin/gpt
 ```
 
-The script uses the existing content-addressed SNAP cache. Cache hits are reused; a missing date is preprocessed once in the parent process. Defaults match the Kulsary pair converter: Precise orbit, Copernicus 30 m DEM, `EPSG:32639`, and 10 m pixels.
+The script uses the existing content-addressed SNAP cache. Cache hits are reused;
+a missing date is preprocessed once in the parent process. VV-only cache entries
+and the old one-band output directory remain untouched, while the first dual-pol
+run creates distinct cache entries. Defaults match the Kulsary pair converter:
+Precise orbit, Copernicus 30 m DEM, `EPSG:32639`, and 10 m pixels.
 
 Output:
 
 ```text
-kulsary_sigma0/
-  before_sigma0_vv.tif
-  peak_sigma0_vv.tif
-  after_sigma0_vv.tif
+kulsary_sigma0_vv_vh/
+  before_sigma0_vv_vh.tif
+  peak_sigma0_vv_vh.tif
+  after_sigma0_vv_vh.tif
   sigma0_manifest.json
 ```
 
@@ -159,7 +196,7 @@ The three formal PNG+PGW pairs are discovered uniquely; files beginning with `_`
 
 ```shell
 uv run python -m water_seg.train \
-  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0 \
+  --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
   --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks
 ```
 
@@ -167,9 +204,9 @@ The Sigma0 root manifest and sampled fingerprints are verified before loading. A
 
 ```shell
 uv run python -m water_seg.train \
-  --sigma0-before /path/to/before_sigma0_vv.tif \
-  --sigma0-peak /path/to/peak_sigma0_vv.tif \
-  --sigma0-after /path/to/after_sigma0_vv.tif \
+  --sigma0-before /path/to/before_sigma0_vv_vh.tif \
+  --sigma0-peak /path/to/peak_sigma0_vv_vh.tif \
+  --sigma0-after /path/to/after_sigma0_vv_vh.tif \
   --mask-source /path/to/kulsary_masks
 ```
 
@@ -177,7 +214,10 @@ uv run python -m water_seg.train \
 
 ## Spatial and temporal sampling
 
-Peak Sigma0 defines the common grid. Before/after are read through bilinear `WarpedVRT`; masks are nearest-neighbor reprojected. Only non-overlapping 256×256 windows with complete mask coverage and finite positive Sigma0 in all dates are retained.
+Peak Sigma0 defines the common grid. Before/after are read through bilinear
+`WarpedVRT`; masks are nearest-neighbor reprojected. Only non-overlapping
+256×256 windows with complete mask coverage and finite positive VV and VH in
+all dates are retained.
 
 Each retained tile contributes exactly:
 
@@ -197,7 +237,10 @@ Linear Sigma0 is converted in memory:
 10 * log10(Sigma0) → clip [-25,0] dB
 ```
 
-No uint8 quantization or RGB ImageNet normalization is applied. Mean and population standard deviation are computed only from the train split. Swin-T uses a one-channel stem initialized from adapted ImageNet weights and a four-scale U-Net decoder `[512,256,128,64]`.
+No uint8 quantization or RGB ImageNet normalization is applied. Mean and
+population standard deviation are computed independently for VV and VH from the
+train split only. Swin-T uses a two-channel stem initialized from adapted
+ImageNet weights and a four-scale U-Net decoder `[512,256,128,64]`.
 
 Important defaults:
 
@@ -224,19 +267,22 @@ When checkpoint paths still exist:
 
 ```shell
 uv run python -m water_seg.eval \
-  --path .tmp/water_swin_tiny_unet/best.pth
+  --path .tmp/water_swin_tiny_unet_vv_vh/best.pth
 ```
 
 To relocate the same Sigma0 dataset:
 
 ```shell
 uv run python -m water_seg.eval \
-  --sigma0-root /new/path/kulsary_sigma0 \
+  --sigma0-root /new/path/kulsary_sigma0_vv_vh \
   --mask-source /new/path/kulsary_masks \
-  --path .tmp/water_swin_tiny_unet/best.pth
+  --path .tmp/water_swin_tiny_unet_vv_vh/best.pth
 ```
 
-Evaluation verifies file fingerprints, common grid, exact tile identities, and split membership. Checkpoint format 2 stores one-channel clipped-dB normalization; format 1 checkpoints are rejected and require retraining.
+Evaluation verifies file fingerprints, common grid, exact tile identities, and
+split membership. Kulsary checkpoint format 3 stores the dual-channel contract,
+per-channel clipped-dB normalization, and resumable state. Legacy single-VV
+formats 1 and 2 are rejected and require preprocessing and retraining.
 
 ## Relationship to DAM-Net
 

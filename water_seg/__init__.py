@@ -1,1 +1,1 @@
-"""Direct Kulsary Sigma0 VV water segmentation."""
+"""Direct Kulsary Sigma0 VV+VH water segmentation."""

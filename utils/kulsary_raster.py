@@ -27,6 +27,7 @@ from utils.kulsary_temporal import (
 
 
 PATCH_SIZE = 256
+POLARIZATIONS = ("VV", "VH")
 
 
 def sampled_file_fingerprint(path: Path, sample_size: int = 1024 * 1024):
@@ -56,12 +57,23 @@ class CommonGrid:
     bounds: tuple[float, float, float, float]
 
 
-def validate_source(dataset, role: str) -> None:
+def validate_source(dataset, role: str, polarizations=POLARIZATIONS) -> None:
     """Reject a Sigma0 raster that cannot be used on the common grid."""
-    if dataset.count != 1:
+    polarizations = tuple(polarizations)
+    band_indexes = tuple(range(1, len(polarizations) + 1))
+    if dataset.count != len(polarizations):
         raise ValueError(
-            f"expected one Sigma0_VV band for {role}, found {dataset.count}"
+            f"expected Sigma0 bands {polarizations} for {role}, "
+            f"found {dataset.count} band(s)"
         )
+    for index, polarization in zip(band_indexes, polarizations):
+        raw_description = dataset.descriptions[index - 1]
+        description = (raw_description or "").upper().replace("-", "_")
+        if description and f"SIGMA0_{polarization}" not in description:
+            raise ValueError(
+                f"unexpected Sigma0 band {index} description for {role}: "
+                f"{raw_description!r}; expected Sigma0_{polarization}"
+            )
     if dataset.crs is None:
         raise ValueError(f"Sigma0 raster has no CRS for {role}")
     if dataset.width <= 0 or dataset.height <= 0:
@@ -218,6 +230,8 @@ def linear_sigma0_to_clipped_db(
 
     sigma = np.asarray(sigma0, dtype=np.float32)
     valid_mask = np.asarray(valid, dtype=bool)
+    if sigma.ndim == valid_mask.ndim + 1:
+        valid_mask = np.broadcast_to(valid_mask, sigma.shape)
     if sigma.shape != valid_mask.shape:
         raise ValueError(
             f"sigma0 shape {sigma.shape} does not match valid shape {valid_mask.shape}"
@@ -244,6 +258,7 @@ class Sigma0Stack:
         paths: dict[str, Path],
         mask_ref: MaskRef | None = None,
         grid: CommonGrid | None = None,
+        polarizations=POLARIZATIONS,
     ):
         if (mask_ref is None) == (grid is None):
             raise ValueError("exactly one of mask_ref or grid is required")
@@ -255,12 +270,14 @@ class Sigma0Stack:
 
         self.datasets = {}
         self.vrts = {}
+        self.polarizations = tuple(polarizations)
+        self.band_indexes = tuple(range(1, len(self.polarizations) + 1))
         try:
             self.datasets = {
                 role: rasterio.open(paths[role]) for role in ROLE_DATES
             }
             for role, dataset in self.datasets.items():
-                validate_source(dataset, role)
+                validate_source(dataset, role, self.polarizations)
             self.grid = (
                 build_common_grid(self.datasets, mask_ref)
                 if mask_ref is not None
@@ -319,6 +336,11 @@ class Sigma0Stack:
     ) -> tuple[np.ndarray, np.ndarray]:
         if role not in ROLE_DATES:
             raise ValueError(f"unknown Sigma0 role: {role}")
+        indexes = (
+            self.band_indexes[0]
+            if len(self.band_indexes) == 1
+            else self.band_indexes
+        )
         if role == "peak":
             peak_window = Window(
                 self.grid.peak_window.col_off + window.col_off,
@@ -327,19 +349,30 @@ class Sigma0Stack:
                 window.height,
             )
             array = self.datasets["peak"].read(
-                1,
+                indexes,
                 window=peak_window,
                 out_dtype="float32",
             )
-            mask = self.datasets["peak"].read_masks(1, window=peak_window) > 0
+            masks = self.datasets["peak"].read_masks(
+                indexes,
+                window=peak_window,
+            ) > 0
         else:
             array = self.vrts[role].read(
-                1,
+                indexes,
                 window=window,
                 out_dtype="float32",
             )
-            mask = self.vrts[role].read_masks(1, window=window) > 0
-        valid = mask & np.isfinite(array) & (array > 0)
+            masks = self.vrts[role].read_masks(
+                indexes,
+                window=window,
+            ) > 0
+        valid_by_band = masks & np.isfinite(array) & (array > 0)
+        valid = (
+            valid_by_band
+            if len(self.band_indexes) == 1
+            else np.all(valid_by_band, axis=0)
+        )
         return array, valid
 
     def read(self, window: Window) -> tuple[dict[str, np.ndarray], np.ndarray]:
@@ -427,7 +460,12 @@ def plan_valid_tiles(
 class LazySigma0Stack:
     """Open Sigma0 rasters per process from serialized paths and grid."""
 
-    def __init__(self, paths: dict[str, Path], grid: CommonGrid):
+    def __init__(
+        self,
+        paths: dict[str, Path],
+        grid: CommonGrid,
+        polarizations=POLARIZATIONS,
+    ):
         missing = [role for role in ROLE_DATES if role not in paths]
         if missing:
             raise ValueError(
@@ -435,6 +473,7 @@ class LazySigma0Stack:
             )
         self.paths = {role: Path(paths[role]) for role in ROLE_DATES}
         self.grid = grid
+        self.polarizations = tuple(polarizations)
         self._stack: Sigma0Stack | None = None
         self._pid: int | None = None
 
@@ -445,7 +484,11 @@ class LazySigma0Stack:
             self._stack = None
             self._pid = pid
         if self._stack is None:
-            self._stack = Sigma0Stack(self.paths, grid=self.grid)
+            self._stack = Sigma0Stack(
+                self.paths,
+                grid=self.grid,
+                polarizations=self.polarizations,
+            )
             self._pid = pid
         return self._stack
 
@@ -467,11 +510,18 @@ class LazySigma0Stack:
 
     def __getstate__(self):
         self.close()
-        return {"paths": dict(self.paths), "grid": self.grid}
+        return {
+            "paths": dict(self.paths),
+            "grid": self.grid,
+            "polarizations": self.polarizations,
+        }
 
     def __setstate__(self, state):
         self.paths = {role: Path(path) for role, path in state["paths"].items()}
         self.grid = state["grid"]
+        self.polarizations = tuple(
+            state.get("polarizations", POLARIZATIONS)
+        )
         self._stack = None
         self._pid = None
 

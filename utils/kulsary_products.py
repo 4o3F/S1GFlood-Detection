@@ -71,8 +71,11 @@ def _select_duplicate(candidates: list[_ParsedCandidate]) -> _ParsedCandidate:
     return min(pool, key=lambda item: str(item.product.root))
 
 
-def validate_kulsary_product_geometry(products: dict[str, SafeProduct]) -> None:
-    """Validate bound Kulsary products are S1A IW GRD ASCENDING orbit 159 VV."""
+def validate_kulsary_product_geometry(
+    products: dict[str, SafeProduct],
+    required_polarizations=("VV",),
+) -> None:
+    """Validate Kulsary geometry and the requested polarization contract."""
     for product in products.values():
         validate_safe_product(product)
 
@@ -105,19 +108,38 @@ def validate_kulsary_product_geometry(products: dict[str, SafeProduct]) -> None:
                 f"Kulsary products have unexpected {label}: "
                 f"{sorted(map(str, actual))}; expected {sorted(map(str, expected))}"
             )
-    missing_vv = [
-        product.identifier
+    required = {
+        str(value).strip().upper() for value in required_polarizations
+    }
+    if not required:
+        raise ValueError("required_polarizations must not be empty")
+    missing = {
+        product.identifier: sorted(
+            required
+            - {value.upper() for value in product.polarizations}
+        )
         for product in products.values()
-        if "VV" not in {value.upper() for value in product.polarizations}
-    ]
-    if missing_vv:
+    }
+    missing = {
+        identifier: values
+        for identifier, values in missing.items()
+        if values
+    }
+    if missing:
+        details = ", ".join(
+            f"{identifier}: {values}"
+            for identifier, values in sorted(missing.items())
+        )
         raise InferenceError(
-            "Kulsary products are missing VV polarization: "
-            f"{', '.join(missing_vv)}"
+            "Kulsary products are missing required polarizations: "
+            f"{details}"
         )
 
 
-def discover_kulsary_grd_products(safe_root: Path) -> dict[str, SafeProduct]:
+def discover_kulsary_grd_products(
+    safe_root: Path,
+    required_polarizations=("VV",),
+) -> dict[str, SafeProduct]:
     """Discover the three Kulsary Orbit 159 GRD SAFE products.
 
     Direct children of ``safe_root`` and ``safe_root/products`` ending in
@@ -194,5 +216,5 @@ def discover_kulsary_grd_products(safe_root: Path) -> dict[str, SafeProduct]:
             )
         products[role] = matches[0]
 
-    validate_kulsary_product_geometry(products)
+    validate_kulsary_product_geometry(products, required_polarizations)
     return products

@@ -11,7 +11,7 @@ import torch
 from water_seg.geoid_dataset import (GEOIDRawWaterDataset,
                                      GEOID_IGNORE_INDEX,
                                      build_geoid_water_index,
-                                     compute_geoid_train_vv_stats,
+                                     compute_geoid_train_channel_stats,
                                      get_geoid_water_loaders,
                                      validate_geoid_files)
 
@@ -85,6 +85,7 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
 
         sigma0 = np.full((2, 256, 256), 0.01, dtype=np.float32)
         sigma0[0, 128:, :] = 0.1
+        sigma0[1, :128, :] = 0.001
         sigma0[0, 0, 4] = 0.0
         rows = []
         for tile_id, image_time, split in (
@@ -120,17 +121,21 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
             pre_image, pre_mask, pre_name = train[0]
             post_image, post_mask, _ = train[1]
 
-        self.assertEqual(tuple(pre_image.shape), (1, 256, 256))
+        self.assertEqual(tuple(pre_image.shape), (2, 256, 256))
         self.assertIn('__x0_y0_s256', pre_name)
         self.assertEqual(pre_mask[0, :5].tolist(), [0, 1, 0, 255, 255])
         self.assertEqual(post_mask[0, :5].tolist(), [0, 1, 1, 255, 255])
         self.assertAlmostEqual(float(pre_image[0, 1, 1]), -20.0, places=5)
+        self.assertAlmostEqual(float(pre_image[1, 1, 1]), -25.0, places=5)
         self.assertAlmostEqual(float(post_image[0, 200, 1]), -10.0, places=5)
 
     def test_stats_and_loaders_use_only_supervised_pixels(self):
         with tempfile.TemporaryDirectory() as directory:
             index = build_geoid_water_index(self._build_tree(directory))
-            mean, std = compute_geoid_train_vv_stats(index, progress=False)
+            means, stds = compute_geoid_train_channel_stats(
+                index,
+                progress=False,
+            )
             train_loader, val_loader = get_geoid_water_loaders(
                 index,
                 batch_size=2,
@@ -139,9 +144,11 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
             )
             images, masks, names = next(iter(train_loader))
 
-        self.assertAlmostEqual(mean, -15.0, places=3)
-        self.assertAlmostEqual(std, 5.0, places=3)
-        self.assertEqual(tuple(images.shape), (2, 1, 256, 256))
+        self.assertAlmostEqual(means[0], -15.0, places=3)
+        self.assertAlmostEqual(stds[0], 5.0, places=3)
+        self.assertAlmostEqual(means[1], -22.5, places=3)
+        self.assertAlmostEqual(stds[1], 2.5, places=3)
+        self.assertEqual(tuple(images.shape), (2, 2, 256, 256))
         self.assertEqual(tuple(masks.shape), (2, 256, 256))
         self.assertEqual(len(names), 2)
         self.assertTrue(bool((masks == GEOID_IGNORE_INDEX).any()))
@@ -154,6 +161,8 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
             sigma0 = np.full((2, 256, 384), 0.01, dtype=np.float32)
             sigma0[0, :, 128:256] = 10 ** -1.5
             sigma0[0, :, 256:] = 0.1
+            sigma0[1, :, :128] = 0.001
+            sigma0[1, :, 128:256] = 10 ** -2.5
             label = np.zeros((256, 384), dtype=np.uint8)
             _write_raster(
                 event / 'label' / 'EMSR100-1-2_label.tif',
@@ -182,18 +191,34 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
                 writer.writerows(rows)
 
             index = build_geoid_water_index(root)
-            mean, std = compute_geoid_train_vv_stats(index, progress=False)
+            means, stds = compute_geoid_train_channel_stats(
+                index,
+                progress=False,
+            )
             dataset = GEOIDRawWaterDataset(index, 'train')
-            values = torch.cat([
-                image.squeeze(0)[mask != GEOID_IGNORE_INDEX]
-                for image, mask, _ in (
-                    dataset[sample_index]
-                    for sample_index in range(len(dataset))
-                )
-            ])
+            records = [
+                dataset[sample_index]
+                for sample_index in range(len(dataset))
+            ]
+            values = [
+                torch.cat([
+                    image[channel][mask != GEOID_IGNORE_INDEX]
+                    for image, mask, _ in records
+                ])
+                for channel in range(2)
+            ]
 
-        self.assertAlmostEqual(mean, float(values.mean()), places=5)
-        self.assertAlmostEqual(std, float(values.std(correction=0)), places=5)
+        for channel in range(2):
+            self.assertAlmostEqual(
+                means[channel],
+                float(values[channel].mean()),
+                places=5,
+            )
+            self.assertAlmostEqual(
+                stds[channel],
+                float(values[channel].std(correction=0)),
+                places=5,
+            )
 
     def test_invalid_raw_label_value_is_rejected_at_read_time(self):
         with tempfile.TemporaryDirectory() as directory:
