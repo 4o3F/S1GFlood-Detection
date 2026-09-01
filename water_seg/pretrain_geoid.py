@@ -11,10 +11,10 @@ from tensorboardX import SummaryWriter
 from utils.kulsary_raster import sampled_file_fingerprint
 from utils.parser import (epoch_count, finite_float, nonnegative_float,
                           nonnegative_int, positive_int)
-from water_seg.engine import (INPUT_CONTRACT, NORMALIZATION_CONTRACT,
-                              build_optimizer, checkpoint_payload,
-                              cleanup_distributed, close_loader,
-                              collect_rng_states,
+from water_seg.engine import (GEOID_INPUT_CONTRACT,
+                              GEOID_NORMALIZATION_CONTRACT, build_optimizer,
+                              checkpoint_payload, cleanup_distributed,
+                              close_loader, collect_rng_states,
                               initialize_distributed, run_epoch,
                               load_checkpoint_file, restore_training_state,
                               save_checkpoint, seed_everything,
@@ -24,6 +24,7 @@ from water_seg.geoid_dataset import (GEOID_IGNORE_INDEX,
                                      GEOID_METADATA_FILENAME,
                                      GEOID_PRETRAINING_FORMAT_VERSION,
                                      GEOID_PRETRAINING_KIND,
+                                     GEOID_RADIOMETRY,
                                      build_geoid_water_index,
                                      get_geoid_water_loaders,
                                      validate_geoid_files)
@@ -46,8 +47,6 @@ def build_parser():
         '--metadata-filename',
         default=GEOID_METADATA_FILENAME,
     )
-    parser.add_argument('--db-min', type=finite_float, default=-25.0)
-    parser.add_argument('--db-max', type=finite_float, default=0.0)
     parser.add_argument(
         '--min-valid-proportion',
         type=finite_float,
@@ -73,7 +72,7 @@ def build_parser():
     parser.add_argument('--seed', type=nonnegative_int, default=42)
     parser.add_argument(
         '--save-dir',
-        default='.tmp/geoid_swin_tiny_unet_vv_vh',
+        default='.tmp/geoid_swin_tiny_unet_vv_vh_unclipped',
     )
     parser.add_argument('--device', default=None)
     parser.add_argument(
@@ -81,7 +80,7 @@ def build_parser():
         type=Path,
         default=None,
         help=(
-            'resume complete training state from a format-2 GEOID checkpoint; '
+            'resume complete training state from a format-3 GEOID checkpoint; '
             'all training/data options, including --epochs, must match'
         ),
     )
@@ -112,8 +111,6 @@ def build_parser():
 
 
 def _validate_options(options):
-    if options.db_min >= options.db_max:
-        raise ValueError('--db-min must be smaller than --db-max')
     if not 0.0 <= options.min_valid_proportion <= 1.0:
         raise ValueError('--min-valid-proportion must be between 0 and 1')
 
@@ -129,8 +126,7 @@ def _load_geoid_channel_constants(index):
         'polarizations',
         'channel_mean',
         'channel_std',
-        'db_min',
-        'db_max',
+        'radiometry',
         'min_valid_proportion',
         'train_samples',
         'metadata_fingerprint',
@@ -146,8 +142,7 @@ def _load_geoid_channel_constants(index):
         )
     counts = index.counts()
     expected = {
-        'db_min': index.db_min,
-        'db_max': index.db_max,
+        'radiometry': GEOID_RADIOMETRY,
         'min_valid_proportion': index.min_valid_proportion,
         'train_samples': counts['train'],
         'metadata_fingerprint': sampled_file_fingerprint(index.metadata_path),
@@ -204,14 +199,14 @@ def _serializable_config(
         ),
         'imagenet_pretrained_requested': options.imagenet_pretrained,
         'architecture': 'SwinTinyUNet',
-        'input': INPUT_CONTRACT,
+        'input': GEOID_INPUT_CONTRACT,
         'in_chans': len(POLARIZATIONS),
         'polarizations': list(POLARIZATIONS),
-        'normalization': NORMALIZATION_CONTRACT,
+        'normalization': GEOID_NORMALIZATION_CONTRACT,
+        'radiometry': GEOID_RADIOMETRY,
         'channel_mean': [float(value) for value in channel_mean],
         'channel_std': [float(value) for value in channel_std],
-        'db_min': index.db_min,
-        'db_max': index.db_max,
+        'invalid_pixel_fill': 'per-channel train mean (normalized zero)',
         'geoid_root': str(index.root),
         'metadata_path': str(index.metadata_path),
         'metadata_fingerprint': sampled_file_fingerprint(index.metadata_path),
@@ -297,8 +292,6 @@ def _run(options, distributed_context):
     index = build_geoid_water_index(
         options.geoid_root,
         metadata_filename=options.metadata_filename,
-        db_min=options.db_min,
-        db_max=options.db_max,
         min_valid_proportion=options.min_valid_proportion,
     )
     file_inventory = validate_geoid_files(index)
@@ -331,6 +324,7 @@ def _run(options, distributed_context):
         index,
         batch_size=options.batch_size,
         num_workers=options.num_workers,
+        channel_mean=channel_mean,
         augmentation=options.augmentation,
         distributed_context=distributed_context,
         sampler_seed=options.seed,

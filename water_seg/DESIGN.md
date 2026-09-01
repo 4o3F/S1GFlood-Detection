@@ -49,8 +49,8 @@ Before the first pretraining run, `compute_geoid_stats` scans the selected
 training coverage once. It groups overlapping windows by source raster, derives
 their exact coverage weights, and writes mean/std plus selection provenance to
 `geoid_stats.py`. The pretraining entry point performs no statistics scan and
-refuses constants whose metadata fingerprint, dB range, validity threshold, or
-train sample count differs from the current index.
+refuses constants whose metadata fingerprint, radiometry contract, validity
+threshold, or train sample count differs from the current index.
 
 ## GEOID label and raster contract
 
@@ -63,7 +63,11 @@ valid label coverage.
 
 Bands 1 and 2 are read in `[VV,VH]` order. Each metadata row contributes its
 `(x,y,256,256)` window; overlapping train windows and non-overlapping validation
-windows remain as published. No prepared GEOID tile cache is written.
+windows remain as published. Valid linear Sigma0 is converted with
+`10*log10(max(Sigma0, float32 eps))` without fixed-range clipping. Invalid
+pixels are ignored by supervision and filled with the corresponding
+train-channel mean, which becomes zero after normalization. No prepared GEOID
+tile cache is written.
 
 ## Stage-one SAFE publication
 
@@ -89,7 +93,7 @@ No worker performs grid planning, mask reprojection, or SNAP processing.
 
 ## Radiometry
 
-Dataset samples remain float32 clipped dB:
+Kulsary samples remain float32 clipped dB:
 
 ```text
 linear Sigma0 → 10*log10 → clip [db_min, db_max]
@@ -97,6 +101,16 @@ linear Sigma0 → 10*log10 → clip [db_min, db_max]
 
 Train-split role tiles alone provide streaming per-channel population mean/std.
 Validation and test pixels never contribute to normalization statistics.
+
+GEOID samples use unclipped float32 dB:
+
+```text
+linear Sigma0 → max(Sigma0, float32 eps) → 10*log10
+```
+
+Its independent one-time statistics scan computes exact train-window-weighted
+per-channel population mean/std under that same unclipped contract. Official
+fixed benchmark constants are not mixed with the selected local train windows.
 
 The local Swin-T patch embedding has two channels. ImageNet initialization adapts
 the timm RGB patch weights with `adapt_input_conv(2, weight)`, maps the final timm
@@ -118,15 +132,17 @@ The U-Net decoder uses channels `[512,256,128,64]` and returns two-class full-re
 
 ## Checkpoints and resume
 
-Kulsary uses checkpoint format 3; GEOID pretraining uses its separate dual-pol
-format 2. Both store model/optimizer/scheduler state, metrics, and required
-provenance:
+Kulsary uses checkpoint format 3; unclipped GEOID pretraining uses its separate
+dual-pol format 3. Both store model/optimizer/scheduler state, metrics, and
+required provenance. Their input contracts remain dataset-specific:
 
 ```text
-input = dual VV+VH channels in [VV,VH] order, clipped dB
-normalization = per-channel train-split clipped-dB mean/std
+Kulsary input = dual VV+VH channels in [VV,VH] order, clipped dB
+Kulsary normalization = per-channel train-split clipped-dB mean/std
+GEOID input = dual VV+VH, epsilon-floored dB without range clipping
+GEOID normalization = per-channel GEOID train-split mean/std
 channel_mean / channel_std
-db_min / db_max
+Kulsary db_min / db_max
 three Sigma0 source paths and mask source
 split seed, block size, split ratios
 common-grid signature
@@ -143,7 +159,8 @@ every kept tile's split membership. `--resume` restores the full state after the
 last completed epoch and requires all data, optimization, scheduler, world-size,
 and epoch-budget settings to match; logging/progress settings may change. Legacy
 single-VV checkpoints are rejected because their stem and normalization contract
-are incompatible.
+are incompatible. GEOID format-2 checkpoints are also rejected because they
+encode the former clipped-dB contract.
 
 ## Compatibility invariants
 

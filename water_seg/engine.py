@@ -14,6 +14,13 @@ CHECKPOINT_FORMAT_VERSION = 3
 POLARIZATIONS = ('VV', 'VH')
 INPUT_CONTRACT = 'dual VV+VH channels in [VV,VH] order, clipped dB'
 NORMALIZATION_CONTRACT = 'per-channel train-split clipped-dB mean/std'
+GEOID_INPUT_CONTRACT = (
+    'dual VV+VH channels in [VV,VH] order, float32-epsilon-floored '
+    '10*log10 Sigma0 dB without range clipping'
+)
+GEOID_NORMALIZATION_CONTRACT = (
+    'per-channel GEOID train-split non-range-clipped-dB mean/std'
+)
 _REQUIRED_CONFIG_KEYS = {
     'architecture',
     'input',
@@ -702,14 +709,22 @@ def load_initial_model_weights(
     if not isinstance(config, dict):
         raise ValueError('initialization checkpoint config must be a dictionary')
     if checkpoint.get('kind') == 'geoid-water-pretraining':
-        if checkpoint.get('format_version') != 2:
+        geoid_format = checkpoint.get('format_version')
+        if geoid_format != 3:
+            if geoid_format == 1:
+                detail = 'single-VV input'
+            elif geoid_format == 2:
+                detail = 'legacy clipped-dB VV+VH input'
+            else:
+                detail = 'unknown input contract'
             raise ValueError(
                 'unsupported GEOID pretraining checkpoint format; '
-                'VV-only format 1 cannot initialize a VV+VH model'
+                f'format {geoid_format!r} uses {detail}; retrain with '
+                'unclipped-dB format 3'
             )
         for key, expected in (
-            ('input', INPUT_CONTRACT),
-            ('normalization', NORMALIZATION_CONTRACT),
+            ('input', GEOID_INPUT_CONTRACT),
+            ('normalization', GEOID_NORMALIZATION_CONTRACT),
             ('in_chans', len(POLARIZATIONS)),
             ('polarizations', list(POLARIZATIONS)),
         ):

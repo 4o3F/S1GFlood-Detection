@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.pretrain_geoid \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --batch-size 8 \
   --num-workers 4 \
-  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
+  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh_unclipped
 ```
 
 For one machine with two GPUs, launch one process per visible GPU:
@@ -35,7 +35,7 @@ CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --batch-size 8 \
   --num-workers 2 \
-  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
+  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh_unclipped
 ```
 
 In DDP mode, `--batch-size` and `--num-workers` are per process/GPU. The command
@@ -48,12 +48,12 @@ keys and are interchangeable with single-GPU runs.
 
 `compute_geoid_stats` is a one-time offline pass. It displays source-level
 progress, computes exact train-window-weighted VV and VH mean/std values, and
-atomically replaces `water_seg/geoid_stats.py` with Python constants plus the metadata
-fingerprint, dB range, validity threshold, and train sample count. Pretraining
-never scans the imagery for statistics; it reads those constants and rejects
-them if their provenance does not match the current CSV selection. Regenerate
-the constants only after changing the dataset metadata, `--db-min`, `--db-max`,
-or `--min-valid-proportion`.
+atomically replaces `water_seg/geoid_stats.py` with Python constants plus the
+metadata fingerprint, radiometry contract, validity threshold, and train sample
+count. Pretraining never scans the imagery for statistics; it reads those
+constants and rejects them if their provenance does not match the current CSV
+selection. Regenerate the constants after changing the dataset metadata,
+radiometry implementation, or `--min-valid-proportion`.
 
 This is not compatible with the Kulsary DataLoader. The GEOID adapter reads
 each official CSV row as a window into:
@@ -74,11 +74,14 @@ the existing `s1grd` GeoTIFFs already provide the two source bands.
 GEOID labels use `0=background`, `1=permanent water`, `2=flood`, and
 `255=ignore`. For a single-temporal complete-water target, class 2 maps to
 background on `pre` images and to water on `post` images; 255 and pixels invalid
-in either polarization are excluded from both cross-entropy and metrics. Both
-channels use the same linear-Sigma0 to clipped `[-25,0]` dB contract as
-Kulsary, with normalization
-statistics computed from valid GEOID training pixels only. The official
-256-pixel windows are retained instead of resized to 224.
+in either polarization are excluded from both cross-entropy and metrics. GEOID
+uses `10*log10(max(linear Sigma0, float32 eps))` without fixed-range clipping,
+matching the official loader's radiometry step, then applies exact per-channel
+mean/std computed from valid GEOID training pixels. Invalid pixels are filled
+with those means before model normalization, so their normalized input is zero
+while their labels remain ignored. This source-domain contract is intentionally
+separate from Kulsary's clipped-dB contract. The official 256-pixel windows are
+retained instead of resized to 224.
 
 Pretraining and fine-tuning remain epoch-based and validate after every epoch.
 Their train/validation loops display batch progress and current loss by default;
@@ -94,8 +97,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.pretrain_geoid \
   --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
   --batch-size 8 \
   --num-workers 4 \
-  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh \
-  --resume .tmp/geoid_swin_tiny_unet_vv_vh/last.pth
+  --save-dir .tmp/geoid_swin_tiny_unet_vv_vh_unclipped \
+  --resume .tmp/geoid_swin_tiny_unet_vv_vh_unclipped/last.pth
 
 CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.train \
   --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
@@ -109,8 +112,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.train \
 Resume is intentionally epoch-boundary only: work in an interrupted partial
 epoch is repeated. Changing the dataset, world size, batch size, scheduler,
 augmentation, split, or epoch budget is rejected instead of silently creating
-a non-equivalent run. Old single-VV checkpoints cannot initialize or resume the
-two-channel model.
+a non-equivalent run. Old single-VV checkpoints and format-2 clipped-dB GEOID
+checkpoints cannot initialize or resume the format-3 unclipped model.
 
 Fine-tune the resulting model on Kulsary:
 
@@ -118,7 +121,7 @@ Fine-tune the resulting model on Kulsary:
 CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.train \
   --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
   --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
-  --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh/best.pth
+  --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh_unclipped/best.pth
 ```
 
 The same target fine-tuning can use both GPUs:
@@ -130,7 +133,7 @@ CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
   -m water_seg.train \
   --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
   --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
-  --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh/best.pth \
+  --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh_unclipped/best.pth \
   --batch-size 4 \
   --num-workers 2
 ```

@@ -8,6 +8,7 @@ import tempfile
 from utils.kulsary_raster import sampled_file_fingerprint
 from utils.parser import finite_float
 from water_seg.geoid_dataset import (GEOID_METADATA_FILENAME,
+                                     GEOID_RADIOMETRY,
                                      build_geoid_water_index,
                                      compute_geoid_train_channel_stats,
                                      validate_geoid_files)
@@ -29,8 +30,6 @@ def build_parser():
         '--metadata-filename',
         default=GEOID_METADATA_FILENAME,
     )
-    parser.add_argument('--db-min', type=finite_float, default=-25.0)
-    parser.add_argument('--db-max', type=finite_float, default=0.0)
     parser.add_argument(
         '--min-valid-proportion',
         type=finite_float,
@@ -51,8 +50,6 @@ def build_parser():
 
 
 def _validate_options(options):
-    if options.db_min >= options.db_max:
-        raise ValueError('--db-min must be smaller than --db-max')
     if not 0.0 <= options.min_valid_proportion <= 1.0:
         raise ValueError('--min-valid-proportion must be between 0 and 1')
 
@@ -98,8 +95,6 @@ def main(argv=None):
     index = build_geoid_water_index(
         options.geoid_root,
         metadata_filename=options.metadata_filename,
-        db_min=options.db_min,
-        db_max=options.db_max,
         min_valid_proportion=options.min_valid_proportion,
     )
     file_inventory = validate_geoid_files(index)
@@ -119,8 +114,7 @@ def main(argv=None):
         'polarizations': list(POLARIZATIONS),
         'channel_mean': [float(value) for value in channel_mean],
         'channel_std': [float(value) for value in channel_std],
-        'db_min': index.db_min,
-        'db_max': index.db_max,
+        'radiometry': GEOID_RADIOMETRY,
         'min_valid_proportion': index.min_valid_proportion,
         'train_samples': counts['train'],
         'metadata_fingerprint': sampled_file_fingerprint(index.metadata_path),

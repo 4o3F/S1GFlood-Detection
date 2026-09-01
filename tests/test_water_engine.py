@@ -8,7 +8,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from water_seg.engine import (CHECKPOINT_FORMAT_VERSION, INPUT_CONTRACT,
+from water_seg.engine import (CHECKPOINT_FORMAT_VERSION,
+                              GEOID_INPUT_CONTRACT,
+                              GEOID_NORMALIZATION_CONTRACT, INPUT_CONTRACT,
                               NORMALIZATION_CONTRACT, build_optimizer,
                               checkpoint_payload, load_initial_model_weights,
                               load_model_checkpoint, metrics_from_confusion,
@@ -289,13 +291,13 @@ class WaterEngineTest(unittest.TestCase):
         }
         payload = {
             'kind': 'geoid-water-pretraining',
-            'format_version': 2,
+            'format_version': 3,
             'epoch': 2,
             'model_state_dict': self.model.state_dict(),
             'config': {
                 'architecture': 'tiny',
-                'input': INPUT_CONTRACT,
-                'normalization': NORMALIZATION_CONTRACT,
+                'input': GEOID_INPUT_CONTRACT,
+                'normalization': GEOID_NORMALIZATION_CONTRACT,
                 'in_chans': 2,
                 'polarizations': ['VV', 'VH'],
             },
@@ -315,6 +317,25 @@ class WaterEngineTest(unittest.TestCase):
         self.assertEqual(loaded['kind'], 'geoid-water-pretraining')
         for name, value in self.model.state_dict().items():
             torch.testing.assert_close(value, expected[name])
+
+    def test_geoid_clipped_format_two_checkpoint_is_rejected(self):
+        payload = {
+            'kind': 'geoid-water-pretraining',
+            'format_version': 2,
+            'model_state_dict': self.model.state_dict(),
+            'config': {
+                'architecture': 'tiny',
+                'input': INPUT_CONTRACT,
+                'normalization': NORMALIZATION_CONTRACT,
+                'in_chans': 2,
+                'polarizations': ['VV', 'VH'],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'legacy-geoid.pth'
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, 'legacy clipped-dB'):
+                load_initial_model_weights(path, self.model)
 
 
 if __name__ == '__main__':

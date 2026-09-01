@@ -447,7 +447,7 @@ You can download our novel public S1GFloods dataset through the following link:
   # Single GPU
   CUDA_VISIBLE_DEVICES=0 uv run python -m water_seg.pretrain_geoid \
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
-    --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
+    --save-dir .tmp/geoid_swin_tiny_unet_vv_vh_unclipped
 
   # Two GPUs (use instead of the single-GPU command)
   CUDA_VISIBLE_DEVICES=0,1 uv run torchrun \
@@ -455,19 +455,20 @@ You can download our novel public S1GFloods dataset through the following link:
     -m water_seg.pretrain_geoid \
     --geoid-root /data/lhx/datasets/GEOID/data/geoid-flood \
     --batch-size 8 --num-workers 2 \
-    --save-dir .tmp/geoid_swin_tiny_unet_vv_vh
+    --save-dir .tmp/geoid_swin_tiny_unet_vv_vh_unclipped
 
   uv run python -m water_seg.train \
     --sigma0-root /home/ubuntu/lhx/Sentinel1-SAR/kulsary_sigma0_vv_vh \
     --mask-source /home/ubuntu/lhx/Sentinel1-SAR/kulsary_masks \
-    --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh/best.pth
+    --init-checkpoint .tmp/geoid_swin_tiny_unet_vv_vh_unclipped/best.pth
   ```
 
   This adapter reads `s1grd` bands 1/2 in `[VV,VH]` order and `label` windows
   referenced by `data_tiles_s256_st128.csv`; other GEOID modalities are not
-  required. Both training commands save `last.pth` after every epoch and accept
-  `--resume path/to/last.pth`; see the module README for the strict resume
-  contract.
+  required. GEOID uses epsilon-floored Sigma0 dB without fixed-range clipping
+  and its own exact train-window per-channel statistics. Both training commands
+  save `last.pth` after every epoch and accept `--resume path/to/last.pth`; see
+  the module README for the strict resume contract.
 
 - Testing
 

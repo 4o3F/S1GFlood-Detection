@@ -11,13 +11,16 @@ import torch.utils.data as data
 from tqdm import tqdm
 
 from utils.kulsary_raster import PATCH_SIZE, POLARIZATIONS
-from water_seg.dataset import _validate_db_range, _water_loader, RandomD4
+from water_seg.dataset import _water_loader, RandomD4
 
 
 GEOID_METADATA_FILENAME = 'data_tiles_s256_st128.csv'
 GEOID_IGNORE_INDEX = 255
 GEOID_PRETRAINING_KIND = 'geoid-water-pretraining'
-GEOID_PRETRAINING_FORMAT_VERSION = 2
+GEOID_PRETRAINING_FORMAT_VERSION = 3
+GEOID_RADIOMETRY = (
+    '10*log10(max(linear Sigma0, float32 eps)) dB without range clipping'
+)
 GEOID_BAND_INDEXES = (1, 2)
 _GEOID_SPLITS = ('train', 'val')
 _GEOID_IMAGE_TIMES = ('pre', 'post')
@@ -108,8 +111,6 @@ class GEOIDWaterIndex:
     root: Path
     metadata_path: Path
     samples: list[GEOIDWaterSample]
-    db_min: float
-    db_max: float
     min_valid_proportion: float
 
     def samples_for(self, split):
@@ -136,12 +137,9 @@ def build_geoid_water_index(
     root,
     *,
     metadata_filename=GEOID_METADATA_FILENAME,
-    db_min=-25.0,
-    db_max=0.0,
     min_valid_proportion=0.01,
 ):
     """Build the official CSV-windowed, single-temporal S1-GRD VV+VH index."""
-    _validate_db_range(db_min, db_max)
     if not math.isfinite(min_valid_proportion) or not (
         0.0 <= min_valid_proportion <= 1.0
     ):
@@ -241,8 +239,6 @@ def build_geoid_water_index(
         root=data_root,
         metadata_path=metadata_path,
         samples=samples,
-        db_min=float(db_min),
-        db_max=float(db_max),
         min_valid_proportion=float(min_valid_proportion),
     )
     for split in _GEOID_SPLITS:
@@ -288,9 +284,17 @@ def _validate_geoid_band_contract(image_source, image_path):
             )
 
 
-def _read_geoid_arrays(sample, db_min, db_max):
+def _linear_sigma0_to_db(values):
+    return np.float32(10.0) * np.log10(
+        np.maximum(values, np.finfo(np.float32).eps)
+    )
+
+
+def _read_geoid_arrays(sample, invalid_db_fill=None):
     if not sample.image_path.is_file():
-        raise FileNotFoundError(f'GEOID S1-GRD image is missing: {sample.image_path}')
+        raise FileNotFoundError(
+            f'GEOID S1-GRD image is missing: {sample.image_path}'
+        )
     if not sample.label_path.is_file():
         raise FileNotFoundError(f'GEOID label is missing: {sample.label_path}')
 
@@ -334,12 +338,22 @@ def _read_geoid_arrays(sample, db_min, db_max):
         np.isfinite(sigma0) & (sigma0 > 0) & (sigma0 <= 1e3)
     )
     image_valid = np.all(valid_by_channel, axis=0)
-    image = np.full(sigma0.shape, np.float32(db_min), dtype=np.float32)
+    if invalid_db_fill is None:
+        invalid_db_fill = (0.0,) * len(POLARIZATIONS)
+    invalid_db_fill = np.asarray(invalid_db_fill, dtype=np.float32)
+    if invalid_db_fill.shape != (len(POLARIZATIONS),):
+        raise ValueError(
+            f'GEOID invalid dB fill must follow {POLARIZATIONS}'
+        )
+    if not bool(np.isfinite(invalid_db_fill).all()):
+        raise ValueError('GEOID invalid dB fill must be finite')
+    image = np.broadcast_to(
+        invalid_db_fill[:, None, None],
+        sigma0.shape,
+    ).copy()
     if bool(image_valid.any()):
-        image[:, image_valid] = np.clip(
-            np.float32(10.0) * np.log10(sigma0[:, image_valid]),
-            np.float32(db_min),
-            np.float32(db_max),
+        image[:, image_valid] = _linear_sigma0_to_db(
+            sigma0[:, image_valid]
         )
 
     mask = np.full(expected_shape, GEOID_IGNORE_INDEX, dtype=np.int64)
@@ -439,11 +453,10 @@ def compute_geoid_train_channel_stats(index, progress=True):
         )
         if not bool(valid.any()):
             continue
-        values = np.clip(
-            np.float32(10.0) * np.log10(sigma0[:, valid]),
-            np.float32(index.db_min),
-            np.float32(index.db_max),
-        ).astype(np.float64, copy=False)
+        values = _linear_sigma0_to_db(sigma0[:, valid]).astype(
+            np.float64,
+            copy=False,
+        )
         weights = coverage[valid].astype(np.float64, copy=False)
         batch_count = int(weights.sum())
         for channel in range(len(POLARIZATIONS)):
@@ -485,20 +498,26 @@ def compute_geoid_train_channel_stats(index, progress=True):
 
 
 class GEOIDRawWaterDataset(data.Dataset):
-    def __init__(self, index, split, augment=False):
+    def __init__(
+        self,
+        index,
+        split,
+        augment=False,
+        invalid_db_fill=None,
+    ):
         if split not in _GEOID_SPLITS:
             raise ValueError(f'unsupported GEOID split: {split}')
         self.index = index
         self.split = split
         self.samples = list(index.samples_for(split))
         self._d4 = RandomD4() if augment else None
+        self.invalid_db_fill = invalid_db_fill
 
     def __getitem__(self, sample_index):
         sample = self.samples[sample_index]
         image, mask = _read_geoid_arrays(
             sample,
-            self.index.db_min,
-            self.index.db_max,
+            invalid_db_fill=self.invalid_db_fill,
         )
         if self._d4 is not None:
             image, mask = self._d4(image, mask)
@@ -518,6 +537,7 @@ def get_geoid_water_loaders(
     index,
     batch_size,
     num_workers,
+    channel_mean,
     augmentation=True,
     distributed_context=None,
     sampler_seed=0,
@@ -526,8 +546,14 @@ def get_geoid_water_loaders(
         index,
         'train',
         augment=augmentation,
+        invalid_db_fill=channel_mean,
     )
-    val_dataset = GEOIDRawWaterDataset(index, 'val', augment=False)
+    val_dataset = GEOIDRawWaterDataset(
+        index,
+        'val',
+        augment=False,
+        invalid_db_fill=channel_mean,
+    )
     return (
         _water_loader(
             train_dataset,

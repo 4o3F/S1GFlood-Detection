@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from water_seg import compute_geoid_stats
 from water_seg import pretrain_geoid
+from water_seg.geoid_dataset import GEOID_RADIOMETRY
 
 
 class FakeIndex:
@@ -13,8 +14,6 @@ class FakeIndex:
         self.root = Path(root).resolve()
         self.metadata_path = self.root / 'data_tiles_s256_st128.csv'
         self.metadata_path.write_text('metadata', encoding='utf-8')
-        self.db_min = -25.0
-        self.db_max = 0.0
         self.min_valid_proportion = 0.01
 
     def counts(self):
@@ -63,6 +62,9 @@ class GEOIDStatsCliTest(unittest.TestCase):
         self.assertEqual(generated['channel_mean'], [-13.25, -18.5])
         self.assertEqual(generated['channel_std'], [4.75, 3.25])
         self.assertEqual(generated['polarizations'], ['VV', 'VH'])
+        self.assertEqual(generated['radiometry'], GEOID_RADIOMETRY)
+        self.assertNotIn('db_min', generated)
+        self.assertNotIn('db_max', generated)
         self.assertEqual(generated['train_samples'], 621250)
         self.assertEqual(generated['s1grd_files'], 19823)
 
@@ -80,14 +82,29 @@ class GEOIDStatsCliTest(unittest.TestCase):
                 'polarizations': ['VV', 'VH'],
                 'channel_mean': [-13.25, -18.5],
                 'channel_std': [4.75, 3.25],
-                'db_min': -25.0,
-                'db_max': 0.0,
+                'radiometry': GEOID_RADIOMETRY,
                 'min_valid_proportion': 0.01,
                 'train_samples': 1,
                 'metadata_fingerprint': {},
             }
             with patch.object(pretrain_geoid, 'GEOID_CHANNEL_STATS', stats):
                 with self.assertRaisesRegex(ValueError, 'train_samples'):
+                    pretrain_geoid._load_geoid_channel_constants(index)
+
+    def test_pretraining_rejects_legacy_clipped_constants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            index = FakeIndex(directory)
+            stats = {
+                'polarizations': ['VV', 'VH'],
+                'channel_mean': [-10.25, -16.86],
+                'channel_std': [4.48, 4.49],
+                'radiometry': 'clipped [-25,0] dB',
+                'min_valid_proportion': 0.01,
+                'train_samples': 621250,
+                'metadata_fingerprint': {},
+            }
+            with patch.object(pretrain_geoid, 'GEOID_CHANNEL_STATS', stats):
+                with self.assertRaisesRegex(ValueError, 'radiometry'):
                     pretrain_geoid._load_geoid_channel_constants(index)
 
 

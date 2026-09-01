@@ -8,6 +8,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from water_seg import pretrain_geoid
+from water_seg.engine import (GEOID_INPUT_CONTRACT,
+                              GEOID_NORMALIZATION_CONTRACT)
+from water_seg.geoid_dataset import GEOID_RADIOMETRY
 
 
 class TinyWaterModel(nn.Module):
@@ -33,8 +36,6 @@ class FakeGEOIDIndex:
         self.root = Path(root).resolve()
         self.metadata_path = self.root / 'data_tiles_s256_st128.csv'
         self.metadata_path.write_text('synthetic metadata', encoding='utf-8')
-        self.db_min = -25.0
-        self.db_max = 0.0
         self.min_valid_proportion = 0.01
 
     def counts(self):
@@ -104,8 +105,19 @@ class GEOIDPretrainCliTest(unittest.TestCase):
             )
 
         self.assertEqual(checkpoint['kind'], 'geoid-water-pretraining')
-        self.assertEqual(checkpoint['format_version'], 2)
+        self.assertEqual(checkpoint['format_version'], 3)
         self.assertEqual(checkpoint['config']['bands'], ['VV', 'VH'])
+        self.assertEqual(checkpoint['config']['input'], GEOID_INPUT_CONTRACT)
+        self.assertEqual(
+            checkpoint['config']['normalization'],
+            GEOID_NORMALIZATION_CONTRACT,
+        )
+        self.assertEqual(
+            checkpoint['config']['radiometry'],
+            GEOID_RADIOMETRY,
+        )
+        self.assertNotIn('db_min', checkpoint['config'])
+        self.assertNotIn('db_max', checkpoint['config'])
         self.assertEqual(checkpoint['config']['ignore_index'], 255)
         self.assertFalse(checkpoint['config']['distributed'])
         self.assertEqual(checkpoint['config']['world_size'], 1)

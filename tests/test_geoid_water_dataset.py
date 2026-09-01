@@ -126,8 +126,35 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
         self.assertEqual(pre_mask[0, :5].tolist(), [0, 1, 0, 255, 255])
         self.assertEqual(post_mask[0, :5].tolist(), [0, 1, 1, 255, 255])
         self.assertAlmostEqual(float(pre_image[0, 1, 1]), -20.0, places=5)
-        self.assertAlmostEqual(float(pre_image[1, 1, 1]), -25.0, places=5)
+        self.assertAlmostEqual(float(pre_image[1, 1, 1]), -30.0, places=5)
         self.assertAlmostEqual(float(post_image[0, 200, 1]), -10.0, places=5)
+
+    def test_invalid_pixels_use_requested_fill_and_remain_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            index = build_geoid_water_index(self._build_tree(directory))
+            dataset = GEOIDRawWaterDataset(
+                index,
+                'train',
+                invalid_db_fill=[-12.0, -20.0],
+            )
+            image, mask, _ = dataset[0]
+
+        self.assertEqual(image[:, 0, 4].tolist(), [-12.0, -20.0])
+        self.assertEqual(int(mask[0, 4]), GEOID_IGNORE_INDEX)
+
+    def test_tiny_positive_sigma0_uses_official_float32_epsilon_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            index = build_geoid_water_index(self._build_tree(directory))
+            image_path = index.samples_for('train')[0].image_path
+            with rasterio.open(image_path, 'r+') as target:
+                sigma0 = target.read()
+                sigma0[0, 0, 5] = 1e-12
+                target.write(sigma0)
+            image, mask, _ = GEOIDRawWaterDataset(index, 'train')[0]
+
+        expected = 10.0 * np.log10(np.finfo(np.float32).eps)
+        self.assertAlmostEqual(float(image[0, 0, 5]), expected, places=5)
+        self.assertNotEqual(int(mask[0, 5]), GEOID_IGNORE_INDEX)
 
     def test_stats_and_loaders_use_only_supervised_pixels(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -140,14 +167,15 @@ class GEOIDWaterDatasetTest(unittest.TestCase):
                 index,
                 batch_size=2,
                 num_workers=0,
+                channel_mean=means,
                 augmentation=False,
             )
             images, masks, names = next(iter(train_loader))
 
         self.assertAlmostEqual(means[0], -15.0, places=3)
         self.assertAlmostEqual(stds[0], 5.0, places=3)
-        self.assertAlmostEqual(means[1], -22.5, places=3)
-        self.assertAlmostEqual(stds[1], 2.5, places=3)
+        self.assertAlmostEqual(means[1], -25.0, places=3)
+        self.assertAlmostEqual(stds[1], 5.0, places=3)
         self.assertEqual(tuple(images.shape), (2, 2, 256, 256))
         self.assertEqual(tuple(masks.shape), (2, 256, 256))
         self.assertEqual(len(names), 2)
